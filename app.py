@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-小云雀 (XiaoYunque) Web API 服务器 v2.1
-优化版本：
-- SQLite 数据库持久化
-- ThreadPoolExecutor 并发限制
-- 线程安全锁
-- 进度追踪
-- 多 Cookies 管理
-- 积分检查自动切换
+XiaoYunque Web API server v2.1.
+
+Features:
+- SQLite persistence
+- ThreadPoolExecutor concurrency control
+- Thread-safe task state
+- Progress tracking
+- Multi-cookie management
+- Automatic credit checking
 """
 
 import asyncio
@@ -21,23 +22,53 @@ import uuid
 import time
 import shutil
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
+from math import gcd
 from concurrent.futures import ThreadPoolExecutor, Future
 from flask import Flask, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+
+def configure_runtime_encoding():
+    if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+    if os.name != 'nt':
+        return
+
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleCP(65001)
+        kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        pass
+
+
+configure_runtime_encoding()
+
 from xiaoyunque import main_wrapper as xiaoyunque_main, load_cookies, get_cookies_files, MODEL_CREDITS_PER_SEC
 
 app = Flask(__name__, static_folder='static', static_url_path='')
+app.json.ensure_ascii = False
 
 @app.after_request
 def after_request(response):
     response.headers.add('Access-Control-Allow-Origin', '*')
     response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
     response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+
+    if response.mimetype in {'application/json', 'text/html', 'text/plain'}:
+        content_type = response.content_type or ''
+        if 'charset=' not in content_type.lower():
+            response.headers['Content-Type'] = f'{response.mimetype}; charset=utf-8'
+
     return response
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,10 +85,30 @@ MAX_CONTENT_LENGTH = 50 * 1024 * 1024
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
 MAX_WORKERS = 3
+SUPPORTED_DURATIONS = {5, 10, 15}
+SUPPORTED_RATIOS = {'16:9', '9:16'}
+DEFAULT_VIDEO_SIZE_BY_RATIO = {
+    '16:9': '1280x720',
+    '9:16': '720x1280',
+}
+MODEL_ALIASES = {
+    'fast': 'fast',
+    'seedance-2.0-fast': 'fast',
+    'viduq3-turbo': 'fast',
+    '2.0': '2.0',
+    'seedance-2.0': '2.0',
+}
+DEFAULT_API_MODEL = 'seedance-2.0-fast'
 PROGRESS_UPDATE_INTERVAL = 10
 PROGRESS_MAX_RUNTIME = 3600
 DEBUG_MODE = True
-SAMPLE_VIDEO_PATH = os.path.join(BASE_DIR, 'downloads', '一位身穿华丽骨甲的战士站在古老_5s_20260326_165849.mp4')
+SAMPLE_VIDEO_PATH = os.path.join(DATA_DIR, 'debug_sample.mp4')
+SAMPLE_VIDEO_BYTES = bytes([
+    0, 0, 0, 24, 102, 116, 121, 112,
+    109, 112, 52, 50, 0, 0, 0, 0,
+    109, 112, 52, 50, 105, 115, 111, 109,
+    0, 0, 0, 8, 102, 114, 101, 101,
+])
 DEBUG_MODE_LOCK = threading.Lock()
 
 def set_debug_mode(enabled: bool):
@@ -69,6 +120,14 @@ def set_debug_mode(enabled: bool):
 def get_debug_mode() -> bool:
     with DEBUG_MODE_LOCK:
         return DEBUG_MODE
+
+
+def ensure_debug_sample_video() -> str:
+    if not os.path.exists(SAMPLE_VIDEO_PATH):
+        os.makedirs(os.path.dirname(SAMPLE_VIDEO_PATH), exist_ok=True)
+        with open(SAMPLE_VIDEO_PATH, 'wb') as f:
+            f.write(SAMPLE_VIDEO_BYTES)
+    return SAMPLE_VIDEO_PATH
 
 PROGRESS_STAGES = [
     {'time': 0, 'progress': 5},
@@ -86,14 +145,123 @@ class TaskStatus(Enum):
     SUCCESS = "success"
     FAILED = "failed"
 
+
+class APIError(Exception):
+    def __init__(self, message: str, status_code: int = 400, param: str = None,
+                 code: str = None, error_type: str = 'invalid_request_error'):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.param = param
+        self.code = code
+        self.error_type = error_type
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_unix_timestamp(value):
+    dt = parse_datetime(value)
+    if not dt:
+        return None
+    return int(dt.timestamp())
+
+
+def default_size_for_ratio(ratio: str) -> str:
+    return DEFAULT_VIDEO_SIZE_BY_RATIO.get(ratio, DEFAULT_VIDEO_SIZE_BY_RATIO['16:9'])
+
+
+def normalize_ratio(ratio_value: str) -> str:
+    ratio = str(ratio_value or '16:9').strip()
+    if ratio not in SUPPORTED_RATIOS:
+        raise APIError('ratio must be 16:9 or 9:16', param='ratio')
+    return ratio
+
+
+def normalize_size(size_value: str):
+    if size_value is None or str(size_value).strip() == '':
+        ratio = '16:9'
+        return default_size_for_ratio(ratio), ratio
+
+    size_text = str(size_value).strip().lower()
+    parts = size_text.split('x')
+    if len(parts) != 2:
+        raise APIError('size must be in WIDTHxHEIGHT format', param='size')
+
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError as exc:
+        raise APIError('size must be in WIDTHxHEIGHT format', param='size') from exc
+
+    if width <= 0 or height <= 0:
+        raise APIError('size must be greater than zero', param='size')
+
+    divisor = gcd(width, height)
+    ratio_key = f'{width // divisor}:{height // divisor}'
+    if ratio_key not in SUPPORTED_RATIOS:
+        raise APIError('only 16:9 and 9:16 sizes are supported', param='size')
+
+    return f'{width}x{height}', ratio_key
+
+
+def normalize_duration(seconds_value, field_name: str = 'seconds') -> int:
+    try:
+        duration = int(seconds_value)
+    except (TypeError, ValueError) as exc:
+        raise APIError(f'{field_name} must be an integer', param=field_name) from exc
+
+    if duration not in SUPPORTED_DURATIONS:
+        allowed = ', '.join(str(item) for item in sorted(SUPPORTED_DURATIONS))
+        raise APIError(f'{field_name} must be one of: {allowed}', param=field_name)
+
+    return duration
+
+
+def resolve_backend_model(model_name: str) -> str:
+    normalized = str(model_name or DEFAULT_API_MODEL).strip()
+    return MODEL_ALIASES.get(normalized, 'fast')
+
+
+def map_task_status_to_openai(status: TaskStatus) -> str:
+    return {
+        TaskStatus.PENDING: 'queued',
+        TaskStatus.RUNNING: 'in_progress',
+        TaskStatus.SUCCESS: 'completed',
+        TaskStatus.FAILED: 'failed',
+    }[status]
+
+
+def openai_error_response(message: str, status_code: int = 400, param: str = None,
+                          code: str = None, error_type: str = 'invalid_request_error'):
+    return jsonify({
+        'error': {
+            'message': message,
+            'type': error_type,
+            'param': param,
+            'code': code,
+        }
+    }), status_code
+
 class Task:
     def __init__(self, task_id: str, prompt: str, duration: int, ratio: str,
-                 model: str, ref_images: list, output_dir: str):
+                 model: str, ref_images: list, output_dir: str, size: str = None,
+                 quality: str = 'standard'):
         self.task_id = task_id
         self.prompt = prompt
         self.duration = duration
         self.ratio = ratio
         self.model = model
+        self.size = size or default_size_for_ratio(ratio)
+        self.quality = quality or 'standard'
         self.ref_images = ref_images
         self.output_dir = output_dir
         self.status = TaskStatus.PENDING
@@ -113,6 +281,8 @@ class Task:
                 'duration': self.duration,
                 'ratio': self.ratio,
                 'model': self.model,
+                'size': self.size,
+                'quality': self.quality,
                 'status': self.status.value,
                 'progress': self.progress,
                 'ref_images_count': len(self.ref_images),
@@ -146,7 +316,9 @@ def init_database():
             error_message TEXT,
             created_at TEXT,
             started_at TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            size TEXT,
+            quality TEXT DEFAULT 'standard'
         )
     ''')
     cursor.execute('''
@@ -168,8 +340,45 @@ def init_database():
             created_at TEXT
         )
     ''')
+    cursor.execute("PRAGMA table_info(tasks)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    if 'size' not in existing_columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN size TEXT")
+    if 'quality' not in existing_columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN quality TEXT DEFAULT 'standard'")
     conn.commit()
     conn.close()
+
+
+def build_openai_video_object(task: Task):
+    with task.lock:
+        result = {
+            'id': task.task_id,
+            'object': 'video',
+            'created_at': to_unix_timestamp(task.created_at),
+            'completed_at': to_unix_timestamp(task.completed_at),
+            'status': map_task_status_to_openai(task.status),
+            'model': task.model,
+            'progress': task.progress,
+            'prompt': task.prompt,
+            'seconds': task.duration,
+            'size': task.size or default_size_for_ratio(task.ratio),
+            'quality': task.quality or 'standard',
+        }
+
+        if task.status == TaskStatus.SUCCESS:
+            result['content_path'] = f'/v1/videos/{task.task_id}/content'
+            if task.completed_at:
+                result['expires_at'] = to_unix_timestamp(task.completed_at + timedelta(days=7))
+
+        if task.status == TaskStatus.FAILED and task.error_message:
+            result['error'] = {
+                'message': task.error_message,
+                'type': 'video_generation_error',
+                'code': 'video_generation_failed',
+            }
+
+        return result
 
 def calculate_progress(elapsed: float) -> int:
     for i in range(len(PROGRESS_STAGES) - 1):
@@ -203,6 +412,37 @@ class TaskManager:
         init_database()
         self._load_pending_tasks()
 
+    def _get_task_ref_images(self, task_id: str):
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute("SELECT image_path FROM task_ref_images WHERE task_id = ?", (task_id,))
+        images = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return images
+
+    def _task_from_row(self, row):
+        size = row[14] if len(row) > 14 and row[14] else default_size_for_ratio(row[3])
+        quality = row[15] if len(row) > 15 and row[15] else 'standard'
+        task = Task(
+            task_id=row[0],
+            prompt=row[1],
+            duration=row[2],
+            ratio=row[3],
+            model=row[4],
+            ref_images=self._get_task_ref_images(row[0]),
+            output_dir=row[6],
+            size=size,
+            quality=quality,
+        )
+        task.status = TaskStatus(row[7])
+        task.progress = row[8] if row[8] else 0
+        task.video_path = row[9]
+        task.error_message = row[10]
+        task.created_at = parse_datetime(row[11]) or task.created_at
+        task.started_at = parse_datetime(row[12])
+        task.completed_at = parse_datetime(row[13])
+        return task
+
     def _load_pending_tasks(self):
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         cursor = conn.cursor()
@@ -212,21 +452,8 @@ class TaskManager:
 
         for row in rows:
             task_id = row[0]
-            task = Task(
-                task_id=row[0], prompt=row[1], duration=row[2], ratio=row[3],
-                model=row[4], ref_images=[], output_dir=row[6]
-            )
+            task = self._task_from_row(row)
             task.status = TaskStatus.PENDING
-            task.progress = row[8] if row[8] else 0
-            task.video_path = row[9]
-            task.error_message = row[10]
-
-            conn2 = sqlite3.connect(DB_PATH, check_same_thread=False)
-            cursor2 = conn2.cursor()
-            cursor2.execute("SELECT image_path FROM task_ref_images WHERE task_id = ?", (task_id,))
-            for img_row in cursor2.fetchall():
-                task.ref_images.append(img_row[0])
-            conn2.close()
 
             with self._tasks_lock:
                 self.tasks[task_id] = task
@@ -234,7 +461,7 @@ class TaskManager:
             if row[7] == 'pending':
                 self.executor.submit(self._execute_task, task_id)
 
-        print(f"[*] 从数据库加载了 {len(rows)} 个未完成任务")
+        print(f"[*] Loaded {len(rows)} unfinished tasks from database")
 
     def _save_task_to_db(self, task: Task):
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -242,15 +469,18 @@ class TaskManager:
         cursor.execute('''
             INSERT OR REPLACE INTO tasks
             (task_id, prompt, duration, ratio, model, ref_images, output_dir,
-             status, progress, video_path, error_message, created_at, started_at, completed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, progress, video_path, error_message, created_at, started_at, completed_at,
+             size, quality)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task.task_id, task.prompt, task.duration, task.ratio, task.model,
             json.dumps(task.ref_images), task.output_dir,
             task.status.value, task.progress, task.video_path, task.error_message,
             task.created_at.isoformat() if task.created_at else None,
             task.started_at.isoformat() if task.started_at else None,
-            task.completed_at.isoformat() if task.completed_at else None
+            task.completed_at.isoformat() if task.completed_at else None,
+            task.size,
+            task.quality,
         ))
         conn.commit()
         conn.close()
@@ -266,7 +496,8 @@ class TaskManager:
         conn.close()
 
     def add_task(self, prompt: str, duration: int, ratio: str, model: str,
-                 ref_images: list, output_dir: str) -> str:
+                 ref_images: list, output_dir: str, size: str = None,
+                 quality: str = 'standard') -> str:
         task_id = str(uuid.uuid4())
         
         rel_images = []
@@ -277,7 +508,7 @@ class TaskManager:
                 rel_path = img_path
             rel_images.append(rel_path)
         
-        task = Task(task_id, prompt, duration, ratio, model, rel_images, output_dir)
+        task = Task(task_id, prompt, duration, ratio, model, rel_images, output_dir, size=size, quality=quality)
 
         with self._tasks_lock:
             self.tasks[task_id] = task
@@ -286,7 +517,7 @@ class TaskManager:
         self._save_task_ref_images(task_id, rel_images)
 
         self.executor.submit(self._execute_task, task_id)
-        print(f"[>] 任务已提交: {task_id}")
+        print(f"[>] Task submitted: {task_id}")
         return task_id
 
     def get_task(self, task_id: str):
@@ -301,15 +532,7 @@ class TaskManager:
         conn.close()
 
         if row:
-            task = Task(
-                task_id=row[0], prompt=row[1], duration=row[2], ratio=row[3],
-                model=row[4], ref_images=[], output_dir=row[6]
-            )
-            task.status = TaskStatus(row[7])
-            task.progress = row[8]
-            task.video_path = row[9]
-            task.error_message = row[10]
-            return task
+            return self._task_from_row(row)
         return None
 
     def get_all_tasks(self, limit: int = 100, offset: int = 0, status: str = None):
@@ -333,16 +556,16 @@ class TaskManager:
                     result.append(self.tasks[task_id].to_dict())
                     continue
 
-            ref_images = []
-            cursor.execute("SELECT image_path FROM task_ref_images WHERE task_id = ?", (task_id,))
-            for img_row in cursor.fetchall():
-                ref_images.append(img_row[0])
+            ref_images = self._get_task_ref_images(task_id)
+            size = row[14] if len(row) > 14 and row[14] else default_size_for_ratio(row[3])
+            quality = row[15] if len(row) > 15 and row[15] else 'standard'
 
             result.append({
                 'task_id': row[0], 'prompt': row[1], 'duration': row[2],
-                'ratio': row[3], 'model': row[4], 'status': row[7],
+                'ratio': row[3], 'model': row[4], 'size': size, 'quality': quality, 'status': row[7],
                 'progress': row[8], 'video_path': row[9],
                 'error_message': row[10], 'created_at': row[11],
+                'started_at': row[12], 'completed_at': row[13],
                 'ref_images': ref_images, 'ref_images_count': len(ref_images)
             })
 
@@ -365,10 +588,11 @@ class TaskManager:
                 task.progress = 5
 
             self._save_task_to_db(task)
+            backend_model = resolve_backend_model(task.model)
 
-            print(f"\n[*] 开始执行任务: {task_id}")
-            print(f"   提示词: {task.prompt}")
-            print(f"   时长: {task.duration}s, 比例: {task.ratio}, 模型: {task.model}")
+            print(f"\n[*] Starting task: {task_id}")
+            print(f"   Prompt: {task.prompt}")
+            print(f"   Duration: {task.duration}s, Ratio: {task.ratio}, Model: {task.model} -> {backend_model}")
 
             progress_thread = threading.Thread(
                 target=self._update_progress, args=(task,), daemon=True
@@ -376,15 +600,16 @@ class TaskManager:
             progress_thread.start()
 
             if DEBUG_MODE:
-                print(f"[DEBUG] 调试模式，直接返回本地视频: {SAMPLE_VIDEO_PATH}")
+                sample_video_path = ensure_debug_sample_video()
+                print(f"[DEBUG] Debug mode enabled, returning local sample video: {sample_video_path}")
                 time.sleep(5)
                 
                 with task.lock:
                     task.status = TaskStatus.SUCCESS
-                    task.video_path = os.path.relpath(SAMPLE_VIDEO_PATH, BASE_DIR)
+                    task.video_path = os.path.relpath(sample_video_path, BASE_DIR)
                     task.progress = 100
                     task.completed_at = datetime.now()
-                    print(f"[OK] 任务完成 (调试模式): {task_id}")
+                    print(f"[OK] Task completed (debug mode): {task_id}")
                 
                 self._save_task_to_db(task)
                 return
@@ -401,7 +626,7 @@ class TaskManager:
                 ref_images=abs_ref_images,
                 duration=task.duration,
                 ratio=task.ratio,
-                model=task.model,
+                model=backend_model,
                 cookies=COOKIES_DIR,
                 output=task.output_dir,
                 dry_run=False,
@@ -421,12 +646,12 @@ class TaskManager:
                     task.video_path = os.path.relpath(result, BASE_DIR)
                     task.progress = 100
                     task.completed_at = datetime.now()
-                    print(f"[OK] 任务完成: {task_id}")
+                    print(f"[OK] Task completed: {task_id}")
                 else:
                     task.status = TaskStatus.FAILED
-                    task.error_message = result if isinstance(result, str) else "未找到生成的视频文件"
+                    task.error_message = result if isinstance(result, str) else "Generated video file not found"
                     task.completed_at = datetime.now()
-                    print(f"[ERROR] 任务失败: {task_id} - {task.error_message}")
+                    print(f"[ERROR] Task failed: {task_id} - {task.error_message}")
 
             self._save_task_to_db(task)
 
@@ -448,7 +673,7 @@ class TaskManager:
 
             elapsed = time.time() - start_time
             if elapsed > PROGRESS_MAX_RUNTIME:
-                print(f"[WARN] 进度更新线程超时退出: {task.task_id}")
+                print(f"[WARN] Progress updater timed out: {task.task_id}")
                 break
 
             with task.lock:
@@ -534,6 +759,132 @@ task_manager = TaskManager()
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def get_request_payload():
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    if request.form:
+        return request.form
+    return {}
+
+
+def collect_uploaded_images(data):
+    uploaded_files = []
+
+    file_fields = ['files', 'input_reference', 'input_reference[]']
+    file_index = 0
+    for field_name in file_fields:
+        if field_name not in request.files:
+            continue
+
+        for file in request.files.getlist(field_name):
+            if file and allowed_file(file.filename):
+                filename = f"{int(time.time())}_{file_index}_{secure_filename(file.filename)}"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                file.save(filepath)
+                uploaded_files.append(filepath)
+                file_index += 1
+
+    image_sources = data.get('images')
+    if image_sources is None and 'input_reference' in data:
+        image_sources = data.get('input_reference')
+    if image_sources is None and 'input_reference[]' in data:
+        image_sources = data.get('input_reference[]')
+
+    if isinstance(image_sources, str):
+        image_sources = [image_sources]
+
+    if request.is_json and image_sources:
+        for i, img_data in enumerate(image_sources):
+            if not isinstance(img_data, str) or not img_data.startswith('data:image'):
+                continue
+            try:
+                import base64
+                _, img_bytes_b64 = img_data.split(',', 1)
+                img_bytes = base64.b64decode(img_bytes_b64)
+                filename = f"image_{i}_{int(time.time())}.png"
+                filepath = os.path.join(UPLOAD_FOLDER, filename)
+                with open(filepath, 'wb') as f:
+                    f.write(img_bytes)
+                uploaded_files.append(filepath)
+            except Exception as exc:
+                print(f"[WARN] Failed to decode base64 image: {exc}")
+
+    return uploaded_files
+
+
+def create_task_from_request(openai_compat: bool = False):
+    data = get_request_payload()
+    prompt = str(data.get('prompt', '')).strip()
+    if not prompt:
+        raise APIError('prompt is required' if openai_compat else '提示词不能为空', param='prompt')
+
+    if openai_compat:
+        duration = normalize_duration(data.get('seconds', data.get('duration', 10)), field_name='seconds')
+        if data.get('size'):
+            size, ratio = normalize_size(data.get('size'))
+        else:
+            ratio = normalize_ratio(data.get('ratio', '16:9'))
+            size = default_size_for_ratio(ratio)
+        model = str(data.get('model') or DEFAULT_API_MODEL).strip()
+    else:
+        duration = normalize_duration(data.get('duration', 10), field_name='duration')
+        ratio = normalize_ratio(data.get('ratio', '16:9'))
+        size = default_size_for_ratio(ratio)
+        model = str(data.get('model') or 'fast').strip()
+
+    cookies_files = get_cookies_files()
+    if not cookies_files:
+        raise APIError('请先上传 Cookie 文件', code='cookies_missing')
+
+    uploaded_files = collect_uploaded_images(data)
+    if not uploaded_files:
+        param_name = 'input_reference[]' if openai_compat else 'files'
+        message = 'at least one input_reference image is required' if openai_compat else '至少需要一张参考图片'
+        raise APIError(message, param=param_name)
+
+    backend_model = resolve_backend_model(model)
+    required_credits = MODEL_CREDITS_PER_SEC.get(backend_model, 5) * duration
+
+    output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
+    os.makedirs(output_dir, exist_ok=True)
+
+    for i, img_path in enumerate(uploaded_files):
+        shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
+
+    final_images = [
+        os.path.join(output_dir, f"ref_{i}_{os.path.basename(path)}")
+        for i, path in enumerate(uploaded_files)
+    ]
+
+    task_id = task_manager.add_task(
+        prompt=prompt,
+        duration=duration,
+        ratio=ratio,
+        model=model,
+        ref_images=final_images,
+        output_dir=output_dir,
+        size=size,
+        quality=str(data.get('quality') or 'standard').strip() or 'standard',
+    )
+
+    task = task_manager.get_task(task_id)
+    return task, required_credits
+
+
+def get_task_video_file(task: Task):
+    if task.status != TaskStatus.SUCCESS or not task.video_path:
+        raise APIError('视频尚未生成完成', status_code=404, code='video_not_ready')
+
+    video_path = task.video_path
+    if not os.path.isabs(video_path):
+        video_path = os.path.join(BASE_DIR, video_path)
+
+    if not os.path.exists(video_path):
+        raise APIError('视频文件不存在', status_code=404, code='video_not_found')
+
+    return video_path
 
 
 @app.route('/')
@@ -661,7 +1012,7 @@ def upload_cookie():
             with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(content)
         else:
-            return jsonify({'status': 'error', 'message': '请上传文件或提供JSON内容'}), 400
+            return jsonify({'status': 'error', 'message': '请上传文件或提供 JSON 内容'}), 400
 
         if content is None:
             try:
@@ -673,7 +1024,7 @@ def upload_cookie():
         if content is not None and not isinstance(content, list):
             if os.path.exists(save_path):
                 os.remove(save_path)
-            return jsonify({'status': 'error', 'message': 'Cookie文件必须是数组格式'}), 400
+            return jsonify({'status': 'error', 'message': 'Cookie 文件必须是数组格式'}), 400
 
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         cursor = conn.cursor()
@@ -710,7 +1061,7 @@ def delete_cookie(cookie_name):
         conn.commit()
         conn.close()
 
-        return jsonify({'status': 'success', 'message': 'Cookie已删除'})
+        return jsonify({'status': 'success', 'message': 'Cookie 已删除'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -723,7 +1074,7 @@ def test_cookie(cookie_name):
 
         cookie_path = os.path.join(COOKIES_DIR, cookie_name)
         if not os.path.exists(cookie_path):
-            return jsonify({'status': 'error', 'message': 'Cookie文件不存在'}), 404
+            return jsonify({'status': 'error', 'message': 'Cookie 文件不存在'}), 404
 
         from xiaoyunque import load_cookies, get_credits_info
 
@@ -777,7 +1128,7 @@ def check_all_cookies():
     try:
         cookies_files = get_cookies_files()
         if not cookies_files:
-            return jsonify({'status': 'success', 'results': [], 'message': '没有找到Cookie文件'})
+            return jsonify({'status': 'success', 'results': [], 'message': '没有找到 Cookie 文件'})
 
         results = []
 
@@ -826,7 +1177,7 @@ def check_all_cookies():
                     'credits': credits,
                     'status': 'success'
                 })
-                print(f"[*] {cookie_name}: {credits} 积分")
+                print(f"[*] {cookie_name}: {credits} credits")
 
             except Exception as e:
                 results.append({
@@ -836,7 +1187,7 @@ def check_all_cookies():
                     'status': 'failed',
                     'error': str(e)
                 })
-                print(f"[!] {cookie_name}: 查询失败 - {e}")
+                print(f"[!] {cookie_name}: query failed - {e}")
 
         return jsonify({
             'status': 'success',
@@ -853,94 +1204,121 @@ def check_all_cookies():
 @app.route('/api/generate-video', methods=['POST'])
 def generate_video():
     try:
-        data = request.form if request.form else request.json
-
-        prompt = data.get('prompt', '').strip()
-        duration = int(data.get('duration', 10))
-        ratio = data.get('ratio', '16:9')
-        model = data.get('model', 'fast')
-
-        if not prompt:
-            return jsonify({'status': 'error', 'message': '提示词不能为空'}), 400
-
-        if duration not in [5, 10, 15]:
-            return jsonify({'status': 'error', 'message': '时长必须是 5、10 或 15 秒'}), 400
-
-        if ratio not in ['16:9', '9:16']:
-            return jsonify({'status': 'error', 'message': '比例必须是 16:9 或 9:16'}), 400
-
-        cookies_files = get_cookies_files()
-        if not cookies_files:
-            return jsonify({'status': 'error', 'message': '请先上传 Cookie 文件'}), 400
-
-        model_map = {'seedance-2.0-fast': 'fast', 'seedance-2.0': '2.0'}
-        xiaoyunque_model = model_map.get(model, 'fast')
-
-        uploaded_files = []
-
-        if 'files' in request.files:
-            files = request.files.getlist('files')
-            for i, file in enumerate(files):
-                if file and allowed_file(file.filename):
-                    filename = f"{int(time.time())}_{i}_{secure_filename(file.filename)}"
-                    filepath = os.path.join(UPLOAD_FOLDER, filename)
-                    file.save(filepath)
-                    uploaded_files.append(filepath)
-
-        if request.is_json and 'images' in data:
-            images_data = data.get('images', [])
-            if isinstance(images_data, str):
-                images_data = [images_data]
-            for i, img_data in enumerate(images_data):
-                if img_data.startswith('data:image'):
-                    import base64
-                    try:
-                        header, img_bytes_b64 = img_data.split(',', 1)
-                        img_bytes = base64.b64decode(img_bytes_b64)
-                        filename = f"image_{i}_{int(time.time())}.png"
-                        filepath = os.path.join(UPLOAD_FOLDER, filename)
-                        with open(filepath, 'wb') as f:
-                            f.write(img_bytes)
-                        uploaded_files.append(filepath)
-                    except Exception as e:
-                        print(f"[WARN] 解析 base64 图片失败: {e}")
-
-        if not uploaded_files:
-            return jsonify({'status': 'error', 'message': '至少需要一张参考图片'}), 400
-
-        required_credits = MODEL_CREDITS_PER_SEC.get(xiaoyunque_model, 5) * duration
-
-        task_id = str(uuid.uuid4())
-        output_dir = os.path.join(UPLOAD_FOLDER, task_id)
-        os.makedirs(output_dir, exist_ok=True)
-
-        for i, img_path in enumerate(uploaded_files):
-            shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
-
-        final_images = [os.path.join(output_dir, f"ref_{i}_{os.path.basename(p)}")
-                       for i, p in enumerate(uploaded_files)]
-
-        result_task_id = task_manager.add_task(
-            prompt=prompt,
-            duration=duration,
-            ratio=ratio,
-            model=xiaoyunque_model,
-            ref_images=final_images,
-            output_dir=output_dir
-        )
-
+        task, required_credits = create_task_from_request(openai_compat=False)
         return jsonify({
             'status': 'success',
-            'task_id': result_task_id,
-            'message': f'视频生成任务已提交 (预计需要 {required_credits} 积分)',
+            'task_id': task.task_id,
+            'message': f'视频生成任务已提交（预计需要 {required_credits} 积分）',
             'required_credits': required_credits,
             'running_tasks': task_manager.get_running_count()
         })
-
+    except APIError as e:
+        return jsonify({'status': 'error', 'message': e.message}), e.status_code
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({'status': 'error', 'message': f'服务器内部错误: {str(e)}'}), 500
+
+
+@app.route('/v1/videos', methods=['POST'])
+def create_video_openai():
+    try:
+        task, _ = create_task_from_request(openai_compat=True)
+        return jsonify(build_openai_video_object(task))
+    except APIError as e:
+        return openai_error_response(
+            e.message,
+            status_code=e.status_code,
+            param=e.param,
+            code=e.code,
+            error_type=e.error_type,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return openai_error_response(
+            f'Internal server error: {str(e)}',
+            status_code=500,
+            code='internal_server_error',
+        )
+
+
+@app.route('/v1/videos/<task_id>', methods=['GET'])
+def get_video_openai(task_id):
+    task = task_manager.get_task(task_id)
+    if not task:
+        return openai_error_response(
+            f'No video found with id {task_id}',
+            status_code=404,
+            param='id',
+            code='video_not_found',
+        )
+    return jsonify(build_openai_video_object(task))
+
+
+@app.route('/v1/videos/<task_id>', methods=['DELETE'])
+def delete_video_openai(task_id):
+    task = task_manager.get_task(task_id)
+    if not task:
+        return openai_error_response(
+            f'No video found with id {task_id}',
+            status_code=404,
+            param='id',
+            code='video_not_found',
+        )
+
+    if not task_manager.delete_task(task_id):
+        return openai_error_response(
+            f'Video {task_id} is still running',
+            status_code=409,
+            param='id',
+            code='video_in_progress',
+        )
+
+    return jsonify({
+        'id': task_id,
+        'object': 'video.deleted',
+        'deleted': True,
+    })
+
+
+@app.route('/v1/videos/<task_id>/content', methods=['GET'])
+def get_video_content_openai(task_id):
+    task = task_manager.get_task(task_id)
+    if not task:
+        return openai_error_response(
+            f'No video found with id {task_id}',
+            status_code=404,
+            param='id',
+            code='video_not_found',
+        )
+
+    variant = request.args.get('variant')
+    if variant and variant not in {'video', 'mp4'}:
+        return openai_error_response(
+            'Only the default video variant is supported',
+            status_code=400,
+            param='variant',
+            code='unsupported_variant',
+        )
+
+    try:
+        video_path = get_task_video_file(task)
+    except APIError as e:
+        return openai_error_response(
+            e.message,
+            status_code=e.status_code,
+            param='id',
+            code=e.code,
+            error_type=e.error_type,
+        )
+
+    return send_file(
+        video_path,
+        mimetype='video/mp4',
+        as_attachment=False,
+        download_name=os.path.basename(video_path),
+    )
 
 
 @app.route('/api/task/<task_id>', methods=['GET'])
@@ -1000,19 +1378,17 @@ def get_video(task_id):
     if not task:
         return jsonify({'status': 'error', 'message': '任务不存在'}), 404
 
-    if task.status != TaskStatus.SUCCESS or not task.video_path:
-        return jsonify({'status': 'error', 'message': '视频尚未生成完成'}), 404
+    try:
+        video_path = get_task_video_file(task)
+    except APIError as e:
+        return jsonify({'status': 'error', 'message': e.message}), e.status_code
 
-    video_path = task.video_path
-    if not os.path.isabs(video_path):
-        video_path = os.path.join(BASE_DIR, video_path)
-
-    if not os.path.exists(video_path):
-        return jsonify({'status': 'error', 'message': '视频文件不存在'}), 404
-
-    return send_file(video_path, mimetype='video/mp4', as_attachment=True)
-
-
+    return send_file(
+        video_path,
+        mimetype='video/mp4',
+        as_attachment=True,
+        download_name=os.path.basename(video_path),
+    )
 @app.route('/api/image/<path:image_path>', methods=['GET'])
 def get_image(image_path):
     if '..' in image_path:
@@ -1067,13 +1443,13 @@ if __name__ == '__main__':
     host = os.environ.get('HOST', '0.0.0.0')
 
     print("\n" + "="*60)
-    print("小云雀 (XiaoYunque) Web API 服务器 v2.1")
+    print("XiaoYunque Web API Server v2.1")
     print("="*60)
-    print(f"数据库: {DB_PATH}")
-    print(f"上传目录: {UPLOAD_FOLDER}")
-    print(f"Cookies目录: {COOKIES_DIR}")
-    print(f"最大并发: {MAX_WORKERS}")
-    print(f"服务地址: http://{host}:{port}")
+    print(f"Database: {DB_PATH}")
+    print(f"Upload directory: {UPLOAD_FOLDER}")
+    print(f"Cookies directory: {COOKIES_DIR}")
+    print(f"Max workers: {MAX_WORKERS}")
+    print(f"Service URL: http://{host}:{port}")
     print("="*60 + "\n")
 
     app.run(host=host, port=port, debug=False, threaded=True)

@@ -1,0 +1,17 @@
+services:
+  xiaoyunque:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xiaoyunque
+    restart: unless-stopped
+    ports:
+      - "8033:8033"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8033"
+    volumes:
+      - ./data:/app/data
+      - ./cookies:/app/cookies
+      - ./uploads:/app/uploads
+      - ./downloads:/app/downloads

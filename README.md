@@ -113,12 +113,19 @@ playwright install chromium
 ### 方式二：Docker 部署
 
 ```bash
-# 使用 docker-compose 启动
-docker-compose up -d xiaoyunque
+# 构建并启动服务
+docker compose up -d xiaoyunque
 
 # 查看日志
-docker-compose logs -f xiaoyunque
+docker compose logs -f xiaoyunque
 ```
+
+Docker Compose 默认挂载以下目录到宿主机，重建容器后数据会保留：
+
+- `./data` → `/app/data`
+- `./cookies` → `/app/cookies`
+- `./uploads` → `/app/uploads`
+- `./downloads` → `/app/downloads`
 
 ### 方式三：直接运行
 
