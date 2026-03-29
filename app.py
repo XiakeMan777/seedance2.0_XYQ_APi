@@ -61,10 +61,12 @@ configure_runtime_encoding()
 
 from xiaoyunque import (
     main_wrapper as xiaoyunque_main,
+    precheck_wrapper as xiaoyunque_precheck,
     load_cookies,
     get_cookies_files,
     MODEL_CREDITS_PER_SEC,
     VIDEO_TIMEOUT_ERROR_MESSAGE,
+    is_error_result as xiaoyunque_is_error_result,
     normalize_cookie_payload,
 )
 
@@ -257,6 +259,33 @@ def openai_error_response(message: str, status_code: int = 400, param: str = Non
     }), status_code
 
 
+def extract_backend_error(result):
+    if not xiaoyunque_is_error_result(result):
+        return None
+    return result.get('error') or None
+
+
+def backend_error_to_api_error(error: dict, param: str = None):
+    if not error:
+        return APIError('视频生成失败，请稍后重试', status_code=500, code='video_generation_failed')
+
+    message = str(error.get('message') or '视频生成失败，请稍后重试')
+    status_code = int(error.get('status_code') or 500)
+    code = str(error.get('code') or 'video_generation_failed')
+    error_type = 'invalid_request_error' if status_code < 500 else 'server_error'
+
+    if code == 'video_generation_timeout':
+        error_type = 'timeout_error'
+
+    return APIError(
+        message,
+        status_code=status_code,
+        param=param,
+        code=code,
+        error_type=error_type,
+    )
+
+
 def build_openai_task_error(task: 'Task'):
     if not task.error_message:
         return None
@@ -266,6 +295,27 @@ def build_openai_task_error(task: 'Task'):
             'message': task.error_message,
             'type': 'timeout_error',
             'code': 'video_generation_timeout',
+        }
+
+    if task.error_message.startswith('图片安全审核未通过'):
+        return {
+            'message': task.error_message,
+            'type': 'invalid_request_error',
+            'code': 'image_security_check_failed',
+        }
+
+    if task.error_message.startswith('文字安全审核未通过'):
+        return {
+            'message': task.error_message,
+            'type': 'invalid_request_error',
+            'code': 'text_security_check_failed',
+        }
+
+    if task.error_message.startswith('可用 Cookie 积分不足'):
+        return {
+            'message': task.error_message,
+            'type': 'invalid_request_error',
+            'code': 'insufficient_credits',
         }
 
     return {
@@ -953,6 +1003,7 @@ class TaskManager:
                 args.cookie_file = assigned_cookie_path
 
             result = xiaoyunque_main(args)
+            backend_error = extract_backend_error(result)
 
             video_files = []
             for file in os.listdir(task.output_dir):
@@ -968,7 +1019,10 @@ class TaskManager:
                     print(f"[OK] Task completed: {task_id}")
                 else:
                     task.status = TaskStatus.FAILED
-                    task.error_message = result if isinstance(result, str) else "Generated video file not found"
+                    if backend_error:
+                        task.error_message = backend_error.get('message') or '视频生成失败，请稍后重试'
+                    else:
+                        task.error_message = result if isinstance(result, str) else '视频生成失败，请稍后重试'
                     task.completed_at = datetime.now()
                     print(f"[ERROR] Task failed: {task_id} - {task.error_message}")
 
@@ -1163,13 +1217,31 @@ def create_task_from_request(openai_compat: bool = False):
         message = 'at least one input_reference image is required' if openai_compat else '至少需要一张参考图片'
         raise APIError(message, param=param_name)
 
+    file_param_name = 'input_reference[]' if openai_compat else 'files'
     backend_model = resolve_backend_model(model)
     required_credits = MODEL_CREDITS_PER_SEC.get(backend_model, 5) * duration
-
-    output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
-    os.makedirs(output_dir, exist_ok=True)
-
+    output_dir = None
     try:
+        precheck_args = argparse.Namespace(
+            prompt=prompt,
+            ref_images=uploaded_files,
+            duration=duration,
+            ratio=ratio,
+            model=backend_model,
+            cookies=COOKIES_DIR,
+            output='.',
+            dry_run=False,
+            cookie_index=None,
+            cookie_file=None,
+        )
+        precheck_result = xiaoyunque_precheck(precheck_args)
+        precheck_error = extract_backend_error(precheck_result)
+        if precheck_error:
+            raise backend_error_to_api_error(precheck_error, param=file_param_name)
+
+        output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
+        os.makedirs(output_dir, exist_ok=True)
+
         for i, img_path in enumerate(uploaded_files):
             shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
 
@@ -1189,14 +1261,16 @@ def create_task_from_request(openai_compat: bool = False):
             quality=str(data.get('quality') or 'standard').strip() or 'standard',
         )
     except Exception:
-        shutil.rmtree(output_dir, ignore_errors=True)
+        if output_dir:
+            shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+    finally:
         for img_path in uploaded_files:
             try:
                 if os.path.exists(img_path):
                     os.remove(img_path)
             except OSError:
                 pass
-        raise
 
     task = task_manager.get_task(task_id)
     return task, required_credits

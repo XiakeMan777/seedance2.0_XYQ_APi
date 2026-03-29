@@ -56,6 +56,44 @@ MODEL_CREDITS_PER_SEC = {
 }
 
 
+def build_error_result(code, message, status_code=500, detail=None, retryable=False):
+    error = {
+        'code': code,
+        'message': message,
+        'status_code': status_code,
+        'retryable': retryable,
+    }
+    if detail not in (None, '', [], {}):
+        error['detail'] = detail
+    return {'error': error}
+
+
+def is_error_result(result):
+    return isinstance(result, dict) and isinstance(result.get('error'), dict)
+
+
+def format_error_detail(detail, max_length=240):
+    if detail in (None, '', [], {}):
+        return ''
+    if isinstance(detail, str):
+        detail_text = detail.strip()
+    else:
+        try:
+            detail_text = json.dumps(detail, ensure_ascii=False)
+        except TypeError:
+            detail_text = str(detail)
+    if len(detail_text) > max_length:
+        return detail_text[:max_length].rstrip() + '...'
+    return detail_text
+
+
+def format_rejection_message(base_message, detail=None):
+    detail_text = format_error_detail(detail)
+    if detail_text:
+        return f'{base_message}: {detail_text}'
+    return base_message
+
+
 def configure_runtime_encoding():
     os.environ.setdefault('PYTHONUTF8', '1')
     os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
@@ -234,8 +272,9 @@ async def security_check_images(page, image_urls):
     if str(resp.get('ret')) != '0':
         return False, f'API error: {resp}'
     hit_list = resp.get('data', {}).get('image_hit_list', [])
+    detail = resp.get('data', {}).get('image_hit_detail_list', [])
     passed = not any(hit_list) if hit_list else True
-    return passed, hit_list
+    return passed, detail or hit_list
 
 
 async def upload_image(page, file_path, workspace_id):
@@ -512,7 +551,12 @@ async def run_with_cookie(prompt, duration, ratio, model, ref_images, output_dir
             log('[ERROR] 文字安全审核未通过')
             await b.close()
             await p.stop()
-            return None
+            return build_error_result(
+                'text_security_check_failed',
+                format_rejection_message('文字安全审核未通过', text_detail),
+                status_code=400,
+                detail=text_detail,
+            )
 
         if img_urls:
             img_ok, img_detail = await security_check_images(page, img_urls)
@@ -521,7 +565,12 @@ async def run_with_cookie(prompt, duration, ratio, model, ref_images, output_dir
                 log('[ERROR] 图片安全审核未通过')
                 await b.close()
                 await p.stop()
-                return None
+                return build_error_result(
+                    'image_security_check_failed',
+                    format_rejection_message('图片安全审核未通过', img_detail),
+                    status_code=400,
+                    detail=img_detail,
+                )
 
         log('[*] 提交任务...')
         thread_id = await submit_task(page, prompt, images, duration, ratio, model, workspace_id)
@@ -561,10 +610,80 @@ async def run_with_cookie(prompt, duration, ratio, model, ref_images, output_dir
         return None
 
 
-async def run(args):
-    model = MODELS.get(args.model, args.model)
-    ratio = args.ratio if args.ratio != '1:1' else '16:9'
+async def precheck_with_cookie(prompt, ref_images, cookie_index, cookies_file):
+    log(f'[*] 预检 Cookie #{cookie_index + 1}: {os.path.basename(cookies_file)}')
 
+    p = await async_playwright().start()
+    b = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+
+    try:
+        ctx = await b.new_context(viewport={'width': 1920, 'height': 1080})
+        cookies = load_cookies(cookies_file)
+        await ctx.add_cookies(cookies)
+        page = await ctx.new_page()
+
+        try:
+            await asyncio.wait_for(
+                page.goto('https://xyq.jianying.com/home', wait_until='domcontentloaded'),
+                timeout=PAGE_LOAD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log('[WARN] 预检页面加载超时，继续尝试')
+        await page.wait_for_timeout(5000)
+
+        ws_resp = json.loads(await api_post(page, '/api/web/v1/workspace/get_user_workspace', {}))
+        if str(ws_resp.get('ret')) != '0':
+            log('[WARN] 预检获取 workspace 失败，尝试其他可用 Cookie')
+            return None
+
+        workspace_id = ws_resp['data']['workspace_id']
+        images = []
+
+        if ref_images:
+            for img_path in ref_images:
+                asset = await upload_image(page, img_path, workspace_id)
+                images.append(asset)
+
+        text_ok, text_detail = await security_check_text(page, prompt)
+        if not text_ok:
+            log('[ERROR] 文字安全审核未通过')
+            return build_error_result(
+                'text_security_check_failed',
+                format_rejection_message('文字安全审核未通过', text_detail),
+                status_code=400,
+                detail=text_detail,
+            )
+
+        if images:
+            img_urls = [img['url'] for img in images]
+            img_ok, img_detail = await security_check_images(page, img_urls)
+            if not img_ok:
+                log('[ERROR] 图片安全审核未通过')
+                return build_error_result(
+                    'image_security_check_failed',
+                    format_rejection_message('图片安全审核未通过', img_detail),
+                    status_code=400,
+                    detail=img_detail,
+                )
+
+        return True
+
+    except Exception as e:
+        traceback.print_exc()
+        log(f'[WARN] 预检失败: {e}')
+        return None
+    finally:
+        try:
+            await b.close()
+        except Exception:
+            pass
+        try:
+            await p.stop()
+        except Exception:
+            pass
+
+
+def resolve_cookie_files(args):
     cookies_files = []
     assigned_cookie_file = getattr(args, 'cookie_file', None)
     if assigned_cookie_file:
@@ -582,8 +701,44 @@ async def run(args):
         if not cookies_files:
             cookies_files = [os.path.join(DEFAULT_COOKIES_DIR, 'cookies.json')]
 
-    for idx, cookies_file in enumerate(cookies_files):
-        cookies_path = os.path.join(DEFAULT_COOKIES_DIR, cookies_file) if not os.path.dirname(cookies_file) else cookies_file
+    resolved_files = []
+    for cookies_file in cookies_files:
+        resolved_files.append(
+            os.path.join(DEFAULT_COOKIES_DIR, cookies_file)
+            if not os.path.dirname(cookies_file)
+            else cookies_file
+        )
+    return resolved_files
+
+
+async def precheck(args):
+    for idx, cookies_path in enumerate(resolve_cookie_files(args)):
+        result = await precheck_with_cookie(
+            prompt=args.prompt,
+            ref_images=args.ref_images,
+            cookie_index=idx,
+            cookies_file=cookies_path,
+        )
+
+        if result is True:
+            return True
+        if is_error_result(result):
+            return result
+
+    return build_error_result(
+        'video_precheck_failed',
+        '创建视频前的安全预检失败，请稍后重试',
+        status_code=500,
+        retryable=True,
+    )
+
+
+async def run(args):
+    model = MODELS.get(args.model, args.model)
+    ratio = args.ratio if args.ratio != '1:1' else '16:9'
+    encountered_insufficient_credits = False
+
+    for idx, cookies_path in enumerate(resolve_cookie_files(args)):
         attempt_started_at = time.monotonic()
         result = await run_with_cookie(
             prompt=args.prompt,
@@ -597,19 +752,42 @@ async def run(args):
         )
 
         if result == 'INSUFFICIENT_CREDITS':
-            log(f'[*] Cookie #{idx + 1} 积分不足，尝试下一个...')
+            encountered_insufficient_credits = True
+            log('[*] 当前 Cookie 积分不足，继续尝试其他可用 Cookie')
+            continue
+        elif is_error_result(result):
+            if result['error'].get('status_code') == 400:
+                return result
+            log('[WARN] 当前 Cookie 执行失败，继续尝试其他可用 Cookie')
             continue
         elif not result and time.monotonic() - attempt_started_at >= POLL_INTERVAL * POLL_MAX_ROUNDS:
             log(f'[ERROR] {VIDEO_TIMEOUT_ERROR_MESSAGE}')
-            return VIDEO_TIMEOUT_ERROR_MESSAGE
+            return build_error_result(
+                'video_generation_timeout',
+                VIDEO_TIMEOUT_ERROR_MESSAGE,
+                status_code=504,
+            )
         elif result:
             return result
         else:
-            log(f'[*] Cookie #{idx + 1} 执行失败，尝试下一个...')
+            log('[WARN] 当前 Cookie 执行失败，继续尝试其他可用 Cookie')
             continue
 
-    log('[ERROR] 所有 Cookie 都执行失败')
-    return None
+    if encountered_insufficient_credits:
+        log('[ERROR] 可用 Cookie 积分不足')
+        return build_error_result(
+            'insufficient_credits',
+            '可用 Cookie 积分不足，请更换后重试',
+            status_code=400,
+        )
+
+    log('[ERROR] 视频生成失败，请稍后重试')
+    return build_error_result(
+        'video_generation_failed',
+        '视频生成失败，请稍后重试',
+        status_code=500,
+        retryable=True,
+    )
 
 
 def main():
@@ -653,6 +831,18 @@ def main_wrapper(args):
                 raise ValueError(f'图片过大: {img} ({os.path.getsize(img) / 1024 / 1024:.1f}MB, 最大20MB)')
     
     return asyncio.run(run(args))
+
+
+def precheck_wrapper(args):
+    """创建任务前的安全预检，仅检查图片和文本审核。"""
+    if args.ref_images:
+        for img in args.ref_images:
+            if not os.path.exists(img):
+                raise FileNotFoundError(f'图片不存在: {img}')
+            if os.path.getsize(img) > MAX_IMAGE_SIZE:
+                raise ValueError(f'图片过大: {img} ({os.path.getsize(img) / 1024 / 1024:.1f}MB, 最大20MB)')
+
+    return asyncio.run(precheck(args))
 
 
 if __name__ == '__main__':
