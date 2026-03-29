@@ -418,6 +418,10 @@
         async function loadAuthStatus() {
             try {
                 const response = await fetch(`${API_BASE}/api/auth/status`);
+                if (!response.ok) {
+                    window.location.href = '/login';
+                    return;
+                }
                 const result = await response.json();
                 if (!result.authenticated) {
                     window.location.href = '/login';
@@ -436,6 +440,7 @@
                 }
             } catch (error) {
                 console.error('加载管理员状态失败', error);
+                window.location.href = '/login';
             }
         }
 
