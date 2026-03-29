@@ -325,6 +325,53 @@ def get_db_connection(row_factory: bool = False):
     return conn
 
 
+def resolve_cookie_file(cookie_name: str):
+    filename = str(cookie_name or '').strip()
+    if not filename:
+        raise ValueError('Cookie 名称不能为空')
+
+    if not filename.endswith('.json'):
+        filename = filename + '.json'
+
+    normalized_name = os.path.basename(filename)
+    if normalized_name in {'', '.', '..'} or normalized_name != filename:
+        raise ValueError('无效的 Cookie 名称')
+
+    return normalized_name, os.path.join(COOKIES_DIR, normalized_name)
+
+
+def save_cookie_payload(cookie_name: str, raw_content):
+    content = normalize_cookie_payload(raw_content)
+    filename, save_path = resolve_cookie_file(cookie_name)
+
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(content, f, ensure_ascii=False, indent=2)
+
+    cookie_record_name = filename.replace('.json', '')
+    now = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT created_at FROM cookies WHERE name = ?", (cookie_record_name,))
+    existing_row = cursor.fetchone()
+    created_at = existing_row[0] if existing_row and existing_row[0] else now
+
+    if existing_row:
+        cursor.execute('''
+            UPDATE cookies
+            SET file_path = ?, credits = NULL, last_used = NULL, status = ?, created_at = ?
+            WHERE name = ?
+        ''', (save_path, 'unknown', created_at, cookie_record_name))
+    else:
+        cursor.execute('''
+            INSERT INTO cookies (name, file_path, credits, last_used, status, created_at)
+            VALUES (?, ?, NULL, NULL, ?, ?)
+        ''', (cookie_record_name, save_path, 'unknown', created_at))
+
+    conn.commit()
+    conn.close()
+    return filename, save_path
+
+
 def ensure_default_admin(cursor):
     cursor.execute("SELECT COUNT(*) FROM admin_users")
     admin_count = cursor.fetchone()[0]
@@ -1259,7 +1306,7 @@ def upload_cookie():
                 name = file.filename
                 if not name.endswith('.json'):
                     name = name + '.json'
-            save_path = os.path.join(COOKIES_DIR, name)
+            _, save_path = resolve_cookie_file(name)
             file.save(save_path)
             with open(save_path, 'r', encoding='utf-8') as f:
                 content = normalize_cookie_payload(json.load(f))
@@ -1269,22 +1316,11 @@ def upload_cookie():
                 name = 'cookie_' + str(int(time.time()))
             if not name.endswith('.json'):
                 name = name + '.json'
-            save_path = os.path.join(COOKIES_DIR, name)
+            _, save_path = resolve_cookie_file(name)
         else:
             return jsonify({'status': 'error', 'message': '请上传文件或提供 JSON 内容'}), 400
 
-        with open(save_path, 'w', encoding='utf-8') as f:
-            json.dump(content, f, ensure_ascii=False, indent=2)
-
-
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO cookies (name, file_path, created_at)
-            VALUES (?, ?, ?)
-        ''', (name.replace('.json', ''), save_path, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
+        name, save_path = save_cookie_payload(name, content)
 
         return jsonify({
             'status': 'success',
@@ -1300,13 +1336,58 @@ def upload_cookie():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
+@app.route('/api/cookies/<cookie_name>', methods=['GET'])
+def get_cookie(cookie_name):
+    try:
+        filename, cookie_path = resolve_cookie_file(cookie_name)
+        if not os.path.exists(cookie_path):
+            return jsonify({'status': 'error', 'message': 'Cookie 文件不存在'}), 404
+
+        with open(cookie_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        return jsonify({
+            'status': 'success',
+            'cookie': {
+                'name': filename.replace('.json', ''),
+                'filename': filename,
+                'content': content
+            }
+        })
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/cookies/<cookie_name>', methods=['PUT'])
+def update_cookie(cookie_name):
+    try:
+        filename, cookie_path = resolve_cookie_file(cookie_name)
+        if not os.path.exists(cookie_path):
+            return jsonify({'status': 'error', 'message': 'Cookie 文件不存在'}), 404
+
+        json_body = request.get_json(silent=True) or {}
+        if 'content' not in json_body:
+            return jsonify({'status': 'error', 'message': '请提供 Cookie JSON 内容'}), 400
+
+        filename, _ = save_cookie_payload(filename, json_body['content'])
+
+        return jsonify({
+            'status': 'success',
+            'message': f'Cookie {filename} 已更新',
+            'filename': filename
+        })
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
 @app.route('/api/cookies/<cookie_name>', methods=['DELETE'])
 def delete_cookie(cookie_name):
     try:
-        if not cookie_name.endswith('.json'):
-            cookie_name = cookie_name + '.json'
-
-        fpath = os.path.join(COOKIES_DIR, cookie_name)
+        cookie_name, fpath = resolve_cookie_file(cookie_name)
         if os.path.exists(fpath):
             os.remove(fpath)
 
@@ -1317,6 +1398,8 @@ def delete_cookie(cookie_name):
         conn.close()
 
         return jsonify({'status': 'success', 'message': 'Cookie 已删除'})
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
@@ -1324,10 +1407,7 @@ def delete_cookie(cookie_name):
 @app.route('/api/cookies/<cookie_name>/test', methods=['POST'])
 def test_cookie(cookie_name):
     try:
-        if not cookie_name.endswith('.json'):
-            cookie_name = cookie_name + '.json'
-
-        cookie_path = os.path.join(COOKIES_DIR, cookie_name)
+        cookie_name, cookie_path = resolve_cookie_file(cookie_name)
         if not os.path.exists(cookie_path):
             return jsonify({'status': 'error', 'message': 'Cookie 文件不存在'}), 404
 
@@ -1372,6 +1452,8 @@ def test_cookie(cookie_name):
             'message': f'积分查询成功: {credits}'
         })
 
+    except ValueError as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
     except Exception as e:
         import traceback
         traceback.print_exc()

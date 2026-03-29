@@ -137,8 +137,11 @@
         .cookie-item .name { font-size: 14px; font-weight: 600; margin-bottom: 4px; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .cookie-item .meta { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
         .cookie-item .credits { font-size: 14px; color: var(--text-main); font-weight: 600; margin-top: 8px; display: inline-block; background: #f3f4f6; padding: 4px 10px; border-radius: 6px; }
+        .cookie-item .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
         .cookie-upload { border: 2px dashed #d1d5db; background: #f9fafb; border-radius: 12px; padding: 40px 20px; text-align: center; cursor: pointer; transition: all 0.2s; margin-top: 24px; }
         .cookie-upload:hover { border-color: var(--primary); background: #f3f4f6; }
+        .cookie-editor-meta { font-size: 13px; color: var(--text-muted); margin-bottom: 14px; line-height: 1.6; }
+        .cookie-editor-meta:empty { display: none; }
         
         /* Helper Elements */
         .credits-info { background: #f9fafb; border: 1px solid var(--border-color); border-radius: 8px; padding: 16px; margin-bottom: 24px; }
@@ -295,13 +298,15 @@
     <div class="modal" id="paste-modal">
         <div class="modal-content">
             <div class="modal-header">
-                <h2>粘贴 Cookie JSON</h2>
+                <h2 id="cookie-editor-title">粘贴 Cookie JSON</h2>
                 <button class="modal-close" onclick="closePasteModal()">&times;</button>
             </div>
+            <div id="cookie-editor-meta" class="cookie-editor-meta"></div>
             <textarea id="cookie-paste-area" placeholder="粘贴 Cookie JSON 内容..." style="width: 100%; min-height: 300px; background: #fff; border: 1px solid var(--border-color); border-radius: 8px; padding: 12px; color: var(--text-main); font-family: monospace; font-size: 12px; resize: vertical; box-shadow: inset var(--shadow-sm);"></textarea>
             <div style="margin-top: 16px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="formatCookieJson()">格式化 JSON</button>
                 <button class="btn btn-secondary" onclick="closePasteModal()">取消</button>
-                <button class="btn btn-primary" onclick="submitPastedCookie()">确认上传</button>
+                <button class="btn btn-primary" id="cookie-editor-save-btn" onclick="submitPastedCookie()">确认上传</button>
             </div>
         </div>
     </div>
@@ -354,6 +359,7 @@
         let currentApiKey = '';
         let refreshTimer = null;
         let redirectingToLogin = false;
+        let editingCookieName = '';
 
         function handleUnauthorized(message = '登录已失效，请重新登录') {
             if (redirectingToLogin) {
@@ -615,28 +621,32 @@
                     return;
                 }
 
-                list.innerHTML = result.cookies.map((cookie, idx) => `
+                list.innerHTML = result.cookies.map(cookie => {
+                    const encodedName = encodeURIComponent(cookie.name);
+                    return `
                     <div class="cookie-item">
                         <div class="icon">👤</div>
                         <div class="info">
                             <div class="name">${escapeHtml(cookie.name)}</div>
-                            <div class="meta">${cookie.filename} · ${formatFileSize(cookie.size)}</div>
+                            <div class="meta">${escapeHtml(cookie.filename)} · ${formatFileSize(cookie.size)}</div>
                         </div>
                         <div class="credits">${cookie.credits !== null ? cookie.credits + ' 积分' : '未测试'}</div>
                         <div class="actions">
-                            <button class="btn btn-success btn-small" onclick="testCookie('${escapeHtml(cookie.name)}')">测试</button>
-                            <button class="btn btn-danger btn-small" onclick="deleteCookie('${escapeHtml(cookie.name)}')">删除</button>
+                            <button class="btn btn-secondary btn-small" data-cookie-name="${encodedName}" onclick="editCookie(decodeURIComponent(this.dataset.cookieName))">编辑</button>
+                            <button class="btn btn-success btn-small" data-cookie-name="${encodedName}" onclick="testCookie(decodeURIComponent(this.dataset.cookieName), this)">测试</button>
+                            <button class="btn btn-danger btn-small" data-cookie-name="${encodedName}" onclick="deleteCookie(decodeURIComponent(this.dataset.cookieName))">删除</button>
                         </div>
                     </div>
-                `).join('');
+                `;
+                }).join('');
             } catch (error) {
                 list.innerHTML = '<div class="empty">加载失败</div>';
                 showToast('加载 Cookie 列表失败', 'error');
             }
         }
 
-        async function testCookie(name) {
-            const btn = event.target;
+        async function testCookie(name, buttonElement = null) {
+            const btn = buttonElement || event.target;
             btn.disabled = true;
             btn.innerHTML = '<span class="loading"></span>';
 
@@ -722,13 +732,74 @@
             }
         }
 
+        function setCookieEditorSubmitState(text, loading = false) {
+            const btn = document.getElementById('cookie-editor-save-btn');
+            btn.disabled = loading;
+            btn.innerHTML = loading ? `<span class="loading"></span> ${text}` : text;
+        }
+
         function uploadCookieByPaste() {
+            editingCookieName = '';
+            document.getElementById('cookie-editor-title').textContent = '粘贴 Cookie JSON';
+            document.getElementById('cookie-editor-meta').textContent = '支持直接粘贴导出的 Cookie JSON，新建一个账号记录。';
+            document.getElementById('cookie-paste-area').value = '';
+            setCookieEditorSubmitState('确认上传');
             document.getElementById('paste-modal').classList.add('show');
+        }
+
+        async function editCookie(name) {
+            editingCookieName = name;
+            document.getElementById('cookie-editor-title').textContent = '编辑 Cookie JSON';
+            document.getElementById('cookie-editor-meta').textContent = `正在读取账号“${name}”的 Cookie JSON，保存后会覆盖原内容并重置积分状态。`;
+            document.getElementById('cookie-paste-area').value = '';
+            document.getElementById('paste-modal').classList.add('show');
+            setCookieEditorSubmitState('读取中...', true);
+
+            try {
+                const response = await apiFetch(`${API_BASE}/api/cookies/${encodeURIComponent(name)}`);
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    document.getElementById('cookie-editor-meta').textContent = `当前正在编辑账号“${result.cookie.name}”的 Cookie JSON。保存后可重新点击“测试”刷新积分。`;
+                    document.getElementById('cookie-paste-area').value = result.cookie.content || '';
+                    document.getElementById('cookie-paste-area').focus();
+                    setCookieEditorSubmitState('保存修改');
+                } else {
+                    showToast(result.message || '读取 Cookie 内容失败', 'error');
+                    closePasteModal();
+                }
+            } catch (error) {
+                if (String(error && error.message) !== 'UNAUTHORIZED') {
+                    showToast('读取 Cookie 内容失败', 'error');
+                }
+                closePasteModal();
+            }
+        }
+
+        function formatCookieJson() {
+            const area = document.getElementById('cookie-paste-area');
+            const content = area.value.trim();
+
+            if (!content) {
+                showToast('请先输入 Cookie JSON 内容', 'error');
+                return;
+            }
+
+            try {
+                area.value = JSON.stringify(JSON.parse(content), null, 2);
+                showToast('JSON 已格式化', 'success');
+            } catch (error) {
+                showToast('当前内容不是有效的 JSON', 'error');
+            }
         }
 
         function closePasteModal() {
             document.getElementById('paste-modal').classList.remove('show');
             document.getElementById('cookie-paste-area').value = '';
+            document.getElementById('cookie-editor-title').textContent = '粘贴 Cookie JSON';
+            document.getElementById('cookie-editor-meta').textContent = '';
+            setCookieEditorSubmitState('确认上传');
+            editingCookieName = '';
         }
 
         function openAccountModal() {
@@ -819,7 +890,8 @@
         }
 
         async function submitPastedCookie() {
-            const name = document.getElementById('cookie-name-input').value.trim() || 'cookie_' + Date.now();
+            const isEditing = Boolean(editingCookieName);
+            const name = isEditing ? editingCookieName : (document.getElementById('cookie-name-input').value.trim() || 'cookie_' + Date.now());
             const content = document.getElementById('cookie-paste-area').value.trim();
             let parsedContent;
 
@@ -835,25 +907,35 @@
                 return;
             }
 
+            setCookieEditorSubmitState(isEditing ? '保存中...' : '上传中...', true);
+
             try {
-                const response = await apiFetch(`${API_BASE}/api/cookies`, {
-                    method: 'POST',
+                const response = await apiFetch(
+                    isEditing ? `${API_BASE}/api/cookies/${encodeURIComponent(name)}` : `${API_BASE}/api/cookies`,
+                    {
+                    method: isEditing ? 'PUT' : 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, content: parsedContent })
+                    body: JSON.stringify(isEditing ? { content: parsedContent } : { name, content: parsedContent })
                 });
                 const result = await response.json();
 
                 if (result.status === 'success') {
-                    showToast('Cookie 上传成功', 'success');
+                    showToast(isEditing ? 'Cookie 已更新' : 'Cookie 上传成功', 'success');
                     closePasteModal();
-                    document.getElementById('cookie-name-input').value = '';
+                    if (!isEditing) {
+                        document.getElementById('cookie-name-input').value = '';
+                    }
                     loadCookies();
                     loadStats();
                 } else {
-                    showToast(result.message || '上传失败', 'error');
+                    showToast(result.message || (isEditing ? '保存失败' : '上传失败'), 'error');
                 }
             } catch (error) {
-                showToast('网络错误', 'error');
+                if (String(error && error.message) !== 'UNAUTHORIZED') {
+                    showToast('网络错误', 'error');
+                }
+            } finally {
+                setCookieEditorSubmitState(isEditing ? '保存修改' : '确认上传');
             }
         }
 
