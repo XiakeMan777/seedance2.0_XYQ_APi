@@ -53,7 +53,13 @@ def configure_runtime_encoding():
 
 configure_runtime_encoding()
 
-from xiaoyunque import main_wrapper as xiaoyunque_main, load_cookies, get_cookies_files, MODEL_CREDITS_PER_SEC
+from xiaoyunque import (
+    main_wrapper as xiaoyunque_main,
+    load_cookies,
+    get_cookies_files,
+    MODEL_CREDITS_PER_SEC,
+    normalize_cookie_payload,
+)
 
 app = Flask(__name__, static_folder='static', static_url_path='')
 app.json.ensure_ascii = False
@@ -975,56 +981,42 @@ def list_cookies():
 
 @app.route('/api/cookies', methods=['POST'])
 def upload_cookie():
+    save_path = None
     try:
+        json_body = request.get_json(silent=True) if request.is_json else None
         name = request.form.get('name', '').strip()
+        if not name and json_body:
+            name = str(json_body.get('name', '')).strip()
         content = None
 
         if 'file' in request.files:
             file = request.files['file']
-            if file:
-                if name:
-                    if not name.endswith('.json'):
-                        name = name + '.json'
-                else:
-                    name = file.filename
-                    if not name.endswith('.json'):
-                        name = name + '.json'
-                save_path = os.path.join(COOKIES_DIR, name)
-                file.save(save_path)
-                try:
-                    with open(save_path, 'r', encoding='utf-8') as f:
-                        content = json.load(f)
-                except:
-                    pass
-        elif request.is_json and request.json and 'content' in request.json:
-            raw_content = request.json['content']
-            if isinstance(raw_content, str):
-                content = raw_content
-            elif isinstance(raw_content, (list, dict)):
-                content = json.dumps(raw_content, ensure_ascii=False)
+            if not file or not file.filename:
+                return jsonify({'status': 'error', 'message': '请上传 Cookie JSON 文件'}), 400
+            if name:
+                if not name.endswith('.json'):
+                    name = name + '.json'
             else:
-                content = str(raw_content)
+                name = file.filename
+                if not name.endswith('.json'):
+                    name = name + '.json'
+            save_path = os.path.join(COOKIES_DIR, name)
+            file.save(save_path)
+            with open(save_path, 'r', encoding='utf-8') as f:
+                content = normalize_cookie_payload(json.load(f))
+        elif json_body and 'content' in json_body:
+            content = normalize_cookie_payload(json_body['content'])
             if not name:
                 name = 'cookie_' + str(int(time.time()))
             if not name.endswith('.json'):
                 name = name + '.json'
             save_path = os.path.join(COOKIES_DIR, name)
-            with open(save_path, 'w', encoding='utf-8') as f:
-                f.write(content)
         else:
             return jsonify({'status': 'error', 'message': '请上传文件或提供 JSON 内容'}), 400
 
-        if content is None:
-            try:
-                with open(save_path, 'r', encoding='utf-8') as f:
-                    content = json.load(f)
-            except:
-                pass
+        with open(save_path, 'w', encoding='utf-8') as f:
+            json.dump(content, f, ensure_ascii=False, indent=2)
 
-        if content is not None and not isinstance(content, list):
-            if os.path.exists(save_path):
-                os.remove(save_path)
-            return jsonify({'status': 'error', 'message': 'Cookie 文件必须是数组格式'}), 400
 
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         cursor = conn.cursor()
@@ -1041,6 +1033,10 @@ def upload_cookie():
             'filename': name
         })
 
+    except ValueError as e:
+        if save_path and os.path.exists(save_path):
+            os.remove(save_path)
+        return jsonify({'status': 'error', 'message': str(e)}), 400
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 

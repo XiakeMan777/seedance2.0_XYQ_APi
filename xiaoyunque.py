@@ -58,13 +58,38 @@ def log(msg):
     print(f'[{t}] {msg}', flush=True)
 
 
+def normalize_cookie_payload(raw):
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            raise ValueError('Cookie 内容不能为空')
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError('Cookie JSON 格式无效') from exc
+
+    if isinstance(raw, dict):
+        for key in ('cookies', 'data', 'items'):
+            value = raw.get(key)
+            if isinstance(value, list):
+                raw = value
+                break
+
+    if not isinstance(raw, list):
+        raise ValueError('Cookie 文件必须是数组格式')
+
+    return raw
+
+
 def load_cookies(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f'Cookies文件不存在: {path}')
     with open(path, 'r', encoding='utf-8') as f:
-        raw = json.load(f)
+        raw = normalize_cookie_payload(json.load(f))
     cleaned = []
-    for c in raw:
+    for idx, c in enumerate(raw):
+        if not isinstance(c, dict):
+            raise ValueError(f'Cookie 第 {idx + 1} 项必须是对象')
         clean = {}
         for k in ['name', 'value', 'domain', 'path', 'expires', 'httpOnly', 'secure']:
             if k == 'expires':

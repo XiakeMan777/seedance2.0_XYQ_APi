@@ -680,6 +680,7 @@
         async function submitPastedCookie() {
             const name = document.getElementById('cookie-name-input').value.trim() || 'cookie_' + Date.now();
             const content = document.getElementById('cookie-paste-area').value.trim();
+            let parsedContent;
 
             if (!content) {
                 showToast('请粘贴 Cookie 内容', 'error');
@@ -687,7 +688,7 @@
             }
 
             try {
-                JSON.parse(content);
+                parsedContent = JSON.parse(content);
             } catch (e) {
                 showToast('无效的 JSON 格式', 'error');
                 return;
@@ -697,7 +698,7 @@
                 const response = await fetch(`${API_BASE}/api/cookies`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, content })
+                    body: JSON.stringify({ name, content: parsedContent })
                 });
                 const result = await response.json();
 
