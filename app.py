@@ -5,7 +5,7 @@ XiaoYunque Web API server v2.1.
 
 Features:
 - SQLite persistence
-- ThreadPoolExecutor concurrency control
+- Per-cookie queue throttling
 - Thread-safe task state
 - Progress tracking
 - Multi-cookie management
@@ -25,7 +25,6 @@ import argparse
 from datetime import datetime, timedelta
 from enum import Enum
 from math import gcd
-from concurrent.futures import ThreadPoolExecutor, Future
 from flask import Flask, request, jsonify, send_file, session, redirect, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -113,7 +112,7 @@ ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'}
 MAX_CONTENT_LENGTH = 50 * 1024 * 1024
 app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 
-MAX_WORKERS = 3
+MAX_TASKS_PER_COOKIE = max(1, int(os.environ.get('MAX_TASKS_PER_COOKIE', os.environ.get('MAX_WORKERS', '3'))))
 SUPPORTED_DURATIONS = {5, 10, 15}
 SUPPORTED_RATIOS = {'16:9', '9:16'}
 DEFAULT_VIDEO_SIZE_BY_RATIO = {
@@ -130,6 +129,7 @@ MODEL_ALIASES = {
 DEFAULT_API_MODEL = 'seedance-2.0-fast'
 PROGRESS_UPDATE_INTERVAL = 10
 PROGRESS_MAX_RUNTIME = 3600
+SYSTEM_BUSY_ERROR_MESSAGE = '系统繁忙，请稍后重试'
 
 PROGRESS_STAGES = [
     {'time': 0, 'progress': 5},
@@ -146,6 +146,9 @@ class TaskStatus(Enum):
     RUNNING = "running"
     SUCCESS = "success"
     FAILED = "failed"
+
+
+ACTIVE_TASK_STATUSES = {TaskStatus.PENDING, TaskStatus.RUNNING}
 
 
 class APIError(Exception):
@@ -274,7 +277,7 @@ def build_openai_task_error(task: 'Task'):
 class Task:
     def __init__(self, task_id: str, prompt: str, duration: int, ratio: str,
                  model: str, ref_images: list, output_dir: str, size: str = None,
-                 quality: str = 'standard'):
+                 quality: str = 'standard', assigned_cookie: str = None):
         self.task_id = task_id
         self.prompt = prompt
         self.duration = duration
@@ -291,6 +294,7 @@ class Task:
         self.created_at = datetime.now()
         self.started_at = None
         self.completed_at = None
+        self.assigned_cookie = assigned_cookie
         self.lock = threading.Lock()
 
     def to_dict(self):
@@ -311,6 +315,8 @@ class Task:
                 'started_at': self.started_at.isoformat() if self.started_at else None,
                 'completed_at': self.completed_at.isoformat() if self.completed_at else None,
             }
+            if self.assigned_cookie:
+                result['assigned_cookie'] = self.assigned_cookie
             if self.video_path:
                 result['video_path'] = self.video_path
             if self.error_message:
@@ -420,7 +426,8 @@ def init_database():
             started_at TEXT,
             completed_at TEXT,
             size TEXT,
-            quality TEXT DEFAULT 'standard'
+            quality TEXT DEFAULT 'standard',
+            assigned_cookie TEXT
         )
     ''')
     cursor.execute('''
@@ -465,6 +472,8 @@ def init_database():
         cursor.execute("ALTER TABLE tasks ADD COLUMN size TEXT")
     if 'quality' not in existing_columns:
         cursor.execute("ALTER TABLE tasks ADD COLUMN quality TEXT DEFAULT 'standard'")
+    if 'assigned_cookie' not in existing_columns:
+        cursor.execute("ALTER TABLE tasks ADD COLUMN assigned_cookie TEXT")
     ensure_default_admin(cursor)
     conn.commit()
     conn.close()
@@ -604,7 +613,7 @@ def build_openai_video_object(task: Task):
             'model': task.model,
             'progress': task.progress,
             'prompt': task.prompt,
-            'seconds': task.duration,
+            'seconds': str(task.duration),
             'size': task.size or default_size_for_ratio(task.ratio),
             'quality': task.quality or 'standard',
         }
@@ -647,10 +656,53 @@ class TaskManager:
             return
         self._initialized = True
         self.tasks: dict = {}
-        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self._tasks_lock = threading.Lock()
         init_database()
         self._load_pending_tasks()
+
+    def _start_task_execution(self, task_id: str):
+        worker = threading.Thread(
+            target=self._execute_task,
+            args=(task_id,),
+            daemon=True,
+            name=f"task-{task_id[:8]}",
+        )
+        worker.start()
+
+    def _get_cookie_queue_counts_locked(self, cookie_files: list):
+        cookie_counts = {cookie_name: 0 for cookie_name in cookie_files}
+        for task in self.tasks.values():
+            if task.status not in ACTIVE_TASK_STATUSES:
+                continue
+            if task.assigned_cookie and task.assigned_cookie in cookie_counts:
+                cookie_counts[task.assigned_cookie] += 1
+        return cookie_counts
+
+    @staticmethod
+    def _pick_cookie_from_counts(cookie_counts: dict, allow_overflow: bool = False):
+        candidates = [
+            (cookie_name, queue_count)
+            for cookie_name, queue_count in cookie_counts.items()
+            if allow_overflow or queue_count < MAX_TASKS_PER_COOKIE
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[1], item[0]))
+        return candidates[0][0]
+
+    def get_cookie_queue_status(self, cookie_files: list = None):
+        cookie_files = list(cookie_files if cookie_files is not None else get_cookies_files())
+        with self._tasks_lock:
+            cookie_counts = self._get_cookie_queue_counts_locked(cookie_files)
+
+        total_capacity = len(cookie_counts) * MAX_TASKS_PER_COOKIE
+        active_tasks = sum(cookie_counts.values())
+        return {
+            'cookie_counts': cookie_counts,
+            'active_tasks': active_tasks,
+            'total_capacity': total_capacity,
+            'available_capacity': max(total_capacity - active_tasks, 0),
+        }
 
     def _get_task_ref_images(self, task_id: str):
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -673,6 +725,7 @@ class TaskManager:
             output_dir=row[6],
             size=size,
             quality=quality,
+            assigned_cookie=row[16] if len(row) > 16 else None,
         )
         task.status = TaskStatus(row[7])
         task.progress = row[8] if row[8] else 0
@@ -690,16 +743,26 @@ class TaskManager:
         rows = cursor.fetchall()
         conn.close()
 
+        cookie_counts = {cookie_name: 0 for cookie_name in get_cookies_files()}
+
         for row in rows:
             task_id = row[0]
             task = self._task_from_row(row)
             task.status = TaskStatus.PENDING
 
+            if cookie_counts:
+                if task.assigned_cookie not in cookie_counts:
+                    assigned_cookie = self._pick_cookie_from_counts(cookie_counts, allow_overflow=True)
+                    if assigned_cookie and assigned_cookie != task.assigned_cookie:
+                        task.assigned_cookie = assigned_cookie
+                        self._save_task_to_db(task)
+                if task.assigned_cookie in cookie_counts:
+                    cookie_counts[task.assigned_cookie] += 1
+
             with self._tasks_lock:
                 self.tasks[task_id] = task
 
-            if row[7] == 'pending':
-                self.executor.submit(self._execute_task, task_id)
+            self._start_task_execution(task_id)
 
         print(f"[*] Loaded {len(rows)} unfinished tasks from database")
 
@@ -710,8 +773,8 @@ class TaskManager:
             INSERT OR REPLACE INTO tasks
             (task_id, prompt, duration, ratio, model, ref_images, output_dir,
              status, progress, video_path, error_message, created_at, started_at, completed_at,
-             size, quality)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             size, quality, assigned_cookie)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task.task_id, task.prompt, task.duration, task.ratio, task.model,
             json.dumps(task.ref_images), task.output_dir,
@@ -721,6 +784,7 @@ class TaskManager:
             task.completed_at.isoformat() if task.completed_at else None,
             task.size,
             task.quality,
+            task.assigned_cookie,
         ))
         conn.commit()
         conn.close()
@@ -739,6 +803,9 @@ class TaskManager:
                  ref_images: list, output_dir: str, size: str = None,
                  quality: str = 'standard') -> str:
         task_id = str(uuid.uuid4())
+        cookie_files = get_cookies_files()
+        if not cookie_files:
+            raise APIError('请先上传 Cookie 文件', code='cookies_missing')
         
         rel_images = []
         for img_path in ref_images:
@@ -747,16 +814,35 @@ class TaskManager:
             else:
                 rel_path = img_path
             rel_images.append(rel_path)
-        
-        task = Task(task_id, prompt, duration, ratio, model, rel_images, output_dir, size=size, quality=quality)
 
         with self._tasks_lock:
+            cookie_counts = self._get_cookie_queue_counts_locked(cookie_files)
+            assigned_cookie = self._pick_cookie_from_counts(cookie_counts)
+            if not assigned_cookie:
+                raise APIError(
+                    SYSTEM_BUSY_ERROR_MESSAGE,
+                    status_code=503,
+                    code='system_busy',
+                    error_type='server_error',
+                )
+            task = Task(
+                task_id,
+                prompt,
+                duration,
+                ratio,
+                model,
+                rel_images,
+                output_dir,
+                size=size,
+                quality=quality,
+                assigned_cookie=assigned_cookie,
+            )
             self.tasks[task_id] = task
 
         self._save_task_to_db(task)
         self._save_task_ref_images(task_id, rel_images)
 
-        self.executor.submit(self._execute_task, task_id)
+        self._start_task_execution(task_id)
         print(f"[>] Task submitted: {task_id}")
         return task_id
 
@@ -806,7 +892,8 @@ class TaskManager:
                 'progress': row[8], 'video_path': row[9],
                 'error_message': row[10], 'created_at': row[11],
                 'started_at': row[12], 'completed_at': row[13],
-                'ref_images': ref_images, 'ref_images_count': len(ref_images)
+                'ref_images': ref_images, 'ref_images_count': len(ref_images),
+                'assigned_cookie': row[16] if len(row) > 16 else None,
             })
 
         conn.close()
@@ -855,8 +942,15 @@ class TaskManager:
                 cookies=COOKIES_DIR,
                 output=task.output_dir,
                 dry_run=False,
-                cookie_index=None
+                cookie_index=None,
+                cookie_file=None,
             )
+
+            if task.assigned_cookie:
+                assigned_cookie_path = os.path.join(COOKIES_DIR, task.assigned_cookie)
+                if not os.path.exists(assigned_cookie_path):
+                    raise FileNotFoundError(f'Assigned cookie not found: {task.assigned_cookie}')
+                args.cookie_file = assigned_cookie_path
 
             result = xiaoyunque_main(args)
 
@@ -928,7 +1022,7 @@ class TaskManager:
             task.completed_at = None
 
         self._save_task_to_db(task)
-        self.executor.submit(self._execute_task, task_id)
+        self._start_task_execution(task_id)
         return True
 
     def delete_task(self, task_id: str) -> bool:
@@ -1075,24 +1169,34 @@ def create_task_from_request(openai_compat: bool = False):
     output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
     os.makedirs(output_dir, exist_ok=True)
 
-    for i, img_path in enumerate(uploaded_files):
-        shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
+    try:
+        for i, img_path in enumerate(uploaded_files):
+            shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
 
-    final_images = [
-        os.path.join(output_dir, f"ref_{i}_{os.path.basename(path)}")
-        for i, path in enumerate(uploaded_files)
-    ]
+        final_images = [
+            os.path.join(output_dir, f"ref_{i}_{os.path.basename(path)}")
+            for i, path in enumerate(uploaded_files)
+        ]
 
-    task_id = task_manager.add_task(
-        prompt=prompt,
-        duration=duration,
-        ratio=ratio,
-        model=model,
-        ref_images=final_images,
-        output_dir=output_dir,
-        size=size,
-        quality=str(data.get('quality') or 'standard').strip() or 'standard',
-    )
+        task_id = task_manager.add_task(
+            prompt=prompt,
+            duration=duration,
+            ratio=ratio,
+            model=model,
+            ref_images=final_images,
+            output_dir=output_dir,
+            size=size,
+            quality=str(data.get('quality') or 'standard').strip() or 'standard',
+        )
+    except Exception:
+        shutil.rmtree(output_dir, ignore_errors=True)
+        for img_path in uploaded_files:
+            try:
+                if os.path.exists(img_path):
+                    os.remove(img_path)
+            except OSError:
+                pass
+        raise
 
     task = task_manager.get_task(task_id)
     return task, required_credits
@@ -1233,11 +1337,14 @@ def index():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     cookies_files = get_cookies_files()
+    queue_status = task_manager.get_cookie_queue_status(cookies_files)
     return jsonify({
         'status': 'healthy',
         'service': 'xiaoyunque-v2.1',
         'version': '2.1.0',
-        'max_workers': MAX_WORKERS,
+        'max_workers': queue_status['total_capacity'],
+        'max_queue_per_cookie': MAX_TASKS_PER_COOKIE,
+        'active_tasks': queue_status['active_tasks'],
         'running_tasks': task_manager.get_running_count(),
         'cookies_count': len(cookies_files),
     })
@@ -1246,6 +1353,8 @@ def health_check():
 @app.route('/api/cookies', methods=['GET'])
 def list_cookies():
     cookies_files = get_cookies_files()
+    queue_status = task_manager.get_cookie_queue_status(cookies_files)
+    cookie_queue_counts = queue_status['cookie_counts']
     cookies_list = []
     for i, fname in enumerate(cookies_files):
         fpath = os.path.join(COOKIES_DIR, fname)
@@ -1254,7 +1363,9 @@ def list_cookies():
             'name': fname.replace('.json', ''),
             'filename': fname,
             'path': fpath,
-            'size': os.path.getsize(fpath) if os.path.exists(fpath) else 0
+            'size': os.path.getsize(fpath) if os.path.exists(fpath) else 0,
+            'queue_count': cookie_queue_counts.get(fname, 0),
+            'queue_limit': MAX_TASKS_PER_COOKIE,
         })
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -1785,7 +1896,8 @@ if __name__ == '__main__':
     print(f"Database: {DB_PATH}")
     print(f"Upload directory: {UPLOAD_FOLDER}")
     print(f"Cookies directory: {COOKIES_DIR}")
-    print(f"Max workers: {MAX_WORKERS}")
+    print(f"Max queue per cookie: {MAX_TASKS_PER_COOKIE}")
+    print(f"Current total capacity: {len(get_cookies_files()) * MAX_TASKS_PER_COOKIE}")
     print(f"Service URL: http://{host}:{port}")
     print("="*60 + "\n")
 

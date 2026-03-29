@@ -566,7 +566,10 @@ async def run(args):
     ratio = args.ratio if args.ratio != '1:1' else '16:9'
 
     cookies_files = []
-    if args.cookie_index is not None:
+    assigned_cookie_file = getattr(args, 'cookie_file', None)
+    if assigned_cookie_file:
+        cookies_files = [assigned_cookie_file]
+    elif args.cookie_index is not None:
         cookie_files_all = get_cookies_files()
         if not cookie_files_all:
             cookie_files_all = [os.path.join(DEFAULT_COOKIES_DIR, 'cookies.json')]
