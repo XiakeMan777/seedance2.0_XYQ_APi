@@ -62,6 +62,7 @@ configure_runtime_encoding()
 from xiaoyunque import (
     main_wrapper as xiaoyunque_main,
     precheck_wrapper as xiaoyunque_precheck,
+    inspect_cookies_wrapper as xiaoyunque_inspect_cookies,
     load_cookies,
     get_cookies_files,
     MODEL_CREDITS_PER_SEC,
@@ -236,6 +237,117 @@ def normalize_duration(seconds_value, field_name: str = 'seconds') -> int:
 def resolve_backend_model(model_name: str) -> str:
     normalized = str(model_name or DEFAULT_API_MODEL).strip()
     return MODEL_ALIASES.get(normalized, 'fast')
+
+
+def calculate_required_credits(model_name: str, duration: int) -> int:
+    backend_model = resolve_backend_model(model_name)
+    return MODEL_CREDITS_PER_SEC.get(backend_model, 5) * int(duration)
+
+
+def calculate_task_required_credits(task: 'Task') -> int:
+    return calculate_required_credits(task.model, task.duration)
+
+
+def persist_cookie_credit_checks(check_results: list, required_credits: int = None):
+    if not check_results:
+        return
+
+    checked_at = datetime.now().isoformat()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    for item in check_results:
+        cookie_filename = os.path.basename(str(item.get('cookie_name') or item.get('cookie_file') or '')).strip()
+        if not cookie_filename:
+            continue
+        if not cookie_filename.endswith('.json'):
+            cookie_filename = cookie_filename + '.json'
+
+        cookie_record_name = cookie_filename.replace('.json', '')
+        cookie_path = os.path.join(COOKIES_DIR, cookie_filename)
+        credits = item.get('credits')
+        if item.get('available'):
+            if credits is None:
+                status = 'unknown'
+            elif required_credits is not None and credits < required_credits:
+                status = 'insufficient'
+            else:
+                status = 'active'
+        else:
+            status = 'invalid' if item.get('error_code') == 'workspace_unavailable' else 'failed'
+
+        cursor.execute("SELECT created_at FROM cookies WHERE name = ?", (cookie_record_name,))
+        existing_row = cursor.fetchone()
+        created_at = existing_row[0] if existing_row and existing_row[0] else checked_at
+
+        cursor.execute('''
+            INSERT INTO cookies (name, file_path, credits, last_used, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(name) DO UPDATE SET
+                file_path = excluded.file_path,
+                credits = excluded.credits,
+                last_used = excluded.last_used,
+                status = excluded.status
+        ''', (cookie_record_name, cookie_path, credits, checked_at, status, created_at))
+
+    conn.commit()
+    conn.close()
+
+
+def inspect_cookies_for_required_credits(required_credits: int, cookie_files: list = None):
+    cookie_files = list(cookie_files if cookie_files is not None else get_cookies_files())
+    if not cookie_files:
+        return []
+
+    resolved_cookie_files = [
+        cookie_file if os.path.isabs(cookie_file) else os.path.join(COOKIES_DIR, cookie_file)
+        for cookie_file in cookie_files
+    ]
+    args = argparse.Namespace(
+        cookie_file=None,
+        cookie_files=resolved_cookie_files,
+        cookie_index=None,
+        required_credits=required_credits,
+    )
+    results = xiaoyunque_inspect_cookies(args) or []
+    persist_cookie_credit_checks(results, required_credits=required_credits)
+    return results
+
+
+def resolve_precheck_cookie_name(precheck_result):
+    if isinstance(precheck_result, dict):
+        cookie_name = str(precheck_result.get('cookie_name') or '').strip()
+        if cookie_name:
+            return os.path.basename(cookie_name)
+    return None
+
+
+def choose_cookie_for_required_credits(required_credits: int, preferred_cookie: str = None,
+                                       exclude_cookies=None, allow_overflow: bool = False,
+                                       current_task: 'Task' = None, credit_statuses: list = None,
+                                       allowed_cookies: list = None):
+    check_results = credit_statuses
+    if check_results is None:
+        excluded = set(exclude_cookies or [])
+        candidate_cookie_files = [
+            cookie_name for cookie_name in get_cookies_files()
+            if cookie_name not in excluded
+        ]
+        if not candidate_cookie_files:
+            return None, {'eligible_cookies': [], 'assignable_cookies': [], 'details': {}, 'check_results': []}
+        check_results = inspect_cookies_for_required_credits(required_credits, candidate_cookie_files)
+
+    selected_cookie, diagnostics = task_manager.pick_cookie_for_required_credits(
+        required_credits,
+        check_results,
+        preferred_cookie=preferred_cookie,
+        allow_overflow=allow_overflow,
+        current_task=current_task,
+        allowed_cookies=allowed_cookies,
+        excluded_cookies=exclude_cookies,
+    )
+    diagnostics['check_results'] = check_results
+    return selected_cookie, diagnostics
 
 
 def map_task_status_to_openai(status: TaskStatus) -> str:
@@ -729,16 +841,32 @@ class TaskManager:
         return cookie_counts
 
     @staticmethod
-    def _pick_cookie_from_counts(cookie_counts: dict, allow_overflow: bool = False):
+    def _pick_cookie_from_counts(cookie_counts: dict, allow_overflow: bool = False,
+                                 allowed_cookies: list = None, preferred_cookie: str = None):
+        allowed_set = set(allowed_cookies) if allowed_cookies is not None else None
         candidates = [
             (cookie_name, queue_count)
             for cookie_name, queue_count in cookie_counts.items()
-            if allow_overflow or queue_count < MAX_TASKS_PER_COOKIE
+            if (allow_overflow or queue_count < MAX_TASKS_PER_COOKIE)
+            and (allowed_set is None or cookie_name in allowed_set)
         ]
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[1], item[0]))
+        candidates.sort(key=lambda item: (
+            0 if preferred_cookie and item[0] == preferred_cookie else 1,
+            item[1],
+            item[0],
+        ))
         return candidates[0][0]
+
+    def _get_cookie_reserved_credits_locked(self, cookie_files: list):
+        reserved_credits = {cookie_name: 0 for cookie_name in cookie_files}
+        for task in self.tasks.values():
+            if task.status not in ACTIVE_TASK_STATUSES:
+                continue
+            if task.assigned_cookie and task.assigned_cookie in reserved_credits:
+                reserved_credits[task.assigned_cookie] += calculate_task_required_credits(task)
+        return reserved_credits
 
     def get_cookie_queue_status(self, cookie_files: list = None):
         cookie_files = list(cookie_files if cookie_files is not None else get_cookies_files())
@@ -753,6 +881,99 @@ class TaskManager:
             'total_capacity': total_capacity,
             'available_capacity': max(total_capacity - active_tasks, 0),
         }
+
+    def _pick_cookie_for_required_credits_locked(self, required_credits: int, credit_statuses: list,
+                                                 preferred_cookie: str = None, allow_overflow: bool = False,
+                                                 current_task: Task = None, allowed_cookies: list = None,
+                                                 excluded_cookies=None):
+        allowed_set = set(allowed_cookies) if allowed_cookies is not None else None
+        excluded_set = set(excluded_cookies or [])
+        cookie_files = []
+        for status in credit_statuses:
+            cookie_name = str(status.get('cookie_name') or '').strip()
+            if cookie_name:
+                cookie_files.append(cookie_name)
+
+        if not cookie_files:
+            return None, {'eligible_cookies': [], 'assignable_cookies': [], 'details': {}, 'selected_cookie': None}
+
+        cookie_counts = self._get_cookie_queue_counts_locked(cookie_files)
+        reserved_credits = self._get_cookie_reserved_credits_locked(cookie_files)
+
+        if current_task and current_task.assigned_cookie in cookie_counts and current_task.status in ACTIVE_TASK_STATUSES:
+            cookie_counts[current_task.assigned_cookie] = max(cookie_counts[current_task.assigned_cookie] - 1, 0)
+            reserved_credits[current_task.assigned_cookie] = max(
+                reserved_credits[current_task.assigned_cookie] - calculate_task_required_credits(current_task),
+                0,
+            )
+
+        eligible_cookies = []
+        details = {}
+        for status in credit_statuses:
+            cookie_name = str(status.get('cookie_name') or '').strip()
+            if not cookie_name:
+                continue
+            if cookie_name in excluded_set:
+                continue
+            if allowed_set is not None and cookie_name not in allowed_set:
+                continue
+
+            credits = status.get('credits')
+            reserved = reserved_credits.get(cookie_name, 0)
+            projected_credits = None if credits is None else credits - reserved
+            is_available = bool(status.get('available'))
+            enough_credits = is_available and projected_credits is not None and projected_credits >= required_credits
+
+            details[cookie_name] = {
+                'credits': credits,
+                'reserved_credits': reserved,
+                'projected_credits': projected_credits,
+                'queue_count': cookie_counts.get(cookie_name, 0),
+                'available': is_available,
+                'enough_credits': enough_credits,
+            }
+            if enough_credits:
+                eligible_cookies.append(cookie_name)
+
+        eligible_cookies.sort(key=lambda cookie_name: (
+            0 if preferred_cookie and cookie_name == preferred_cookie else 1,
+            cookie_counts.get(cookie_name, 0),
+            cookie_name,
+        ))
+
+        assignable_cookies = [
+            cookie_name for cookie_name in eligible_cookies
+            if allow_overflow or cookie_counts.get(cookie_name, 0) < MAX_TASKS_PER_COOKIE
+        ]
+
+        selected_cookie = self._pick_cookie_from_counts(
+            cookie_counts,
+            allow_overflow=allow_overflow,
+            allowed_cookies=eligible_cookies,
+            preferred_cookie=preferred_cookie,
+        )
+
+        return selected_cookie, {
+            'eligible_cookies': eligible_cookies,
+            'assignable_cookies': assignable_cookies,
+            'details': details,
+            'selected_cookie': selected_cookie,
+        }
+
+    def pick_cookie_for_required_credits(self, required_credits: int, credit_statuses: list,
+                                         preferred_cookie: str = None, allow_overflow: bool = False,
+                                         current_task: Task = None, allowed_cookies: list = None,
+                                         excluded_cookies=None):
+        with self._tasks_lock:
+            return self._pick_cookie_for_required_credits_locked(
+                required_credits,
+                credit_statuses,
+                preferred_cookie=preferred_cookie,
+                allow_overflow=allow_overflow,
+                current_task=current_task,
+                allowed_cookies=allowed_cookies,
+                excluded_cookies=excluded_cookies,
+            )
 
     def _get_task_ref_images(self, task_id: str):
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -851,7 +1072,9 @@ class TaskManager:
 
     def add_task(self, prompt: str, duration: int, ratio: str, model: str,
                  ref_images: list, output_dir: str, size: str = None,
-                 quality: str = 'standard') -> str:
+                 quality: str = 'standard', assigned_cookie: str = None,
+                 eligible_cookies: list = None, required_credits: int = None,
+                 credit_statuses: list = None) -> str:
         task_id = str(uuid.uuid4())
         cookie_files = get_cookies_files()
         if not cookie_files:
@@ -866,8 +1089,47 @@ class TaskManager:
             rel_images.append(rel_path)
 
         with self._tasks_lock:
-            cookie_counts = self._get_cookie_queue_counts_locked(cookie_files)
-            assigned_cookie = self._pick_cookie_from_counts(cookie_counts)
+            if required_credits is not None and credit_statuses is not None:
+                assigned_cookie, reservation_diagnostics = self._pick_cookie_for_required_credits_locked(
+                    required_credits,
+                    credit_statuses,
+                    preferred_cookie=assigned_cookie,
+                    allowed_cookies=eligible_cookies,
+                )
+                if not assigned_cookie:
+                    if reservation_diagnostics.get('eligible_cookies'):
+                        raise APIError(
+                            SYSTEM_BUSY_ERROR_MESSAGE,
+                            status_code=503,
+                            code='system_busy',
+                            error_type='server_error',
+                        )
+
+                    available_cookie_exists = any(
+                        item.get('available')
+                        for item in reservation_diagnostics.get('details', {}).values()
+                    )
+                    if available_cookie_exists:
+                        raise APIError(
+                            '可用 Cookie 积分不足，请更换后重试',
+                            status_code=400,
+                            code='insufficient_credits',
+                        )
+
+                    raise APIError(
+                        '没有可用的 Cookie，请检查账号状态后重试',
+                        status_code=503,
+                        code='cookies_unavailable',
+                        error_type='server_error',
+                    )
+            else:
+                cookie_counts = self._get_cookie_queue_counts_locked(cookie_files)
+                preferred_cookie = assigned_cookie
+                assigned_cookie = self._pick_cookie_from_counts(
+                    cookie_counts,
+                    allowed_cookies=eligible_cookies,
+                    preferred_cookie=preferred_cookie,
+                )
             if not assigned_cookie:
                 raise APIError(
                     SYSTEM_BUSY_ERROR_MESSAGE,
@@ -994,16 +1256,85 @@ class TaskManager:
                 dry_run=False,
                 cookie_index=None,
                 cookie_file=None,
+                cookie_files=None,
             )
 
-            if task.assigned_cookie:
-                assigned_cookie_path = os.path.join(COOKIES_DIR, task.assigned_cookie)
-                if not os.path.exists(assigned_cookie_path):
-                    raise FileNotFoundError(f'Assigned cookie not found: {task.assigned_cookie}')
-                args.cookie_file = assigned_cookie_path
+            required_credits = calculate_task_required_credits(task)
+            attempted_cookies = set()
+            result = None
+            backend_error = None
 
-            result = xiaoyunque_main(args)
-            backend_error = extract_backend_error(result)
+            while True:
+                current_cookie = task.assigned_cookie
+                if current_cookie:
+                    assigned_cookie_path = os.path.join(COOKIES_DIR, current_cookie)
+                    if not os.path.exists(assigned_cookie_path):
+                        attempted_cookies.add(current_cookie)
+                        replacement_cookie, replacement_diagnostics = choose_cookie_for_required_credits(
+                            required_credits,
+                            exclude_cookies=attempted_cookies,
+                            current_task=task,
+                        )
+                        if not replacement_cookie:
+                            if replacement_diagnostics.get('eligible_cookies'):
+                                result = {'error': {'code': 'system_busy', 'message': SYSTEM_BUSY_ERROR_MESSAGE, 'status_code': 503}}
+                                backend_error = extract_backend_error(result)
+                                break
+
+                            available_cookie_exists = any(
+                                item.get('available')
+                                for item in replacement_diagnostics.get('details', {}).values()
+                            )
+                            if available_cookie_exists:
+                                result = {'error': {'code': 'insufficient_credits', 'message': '可用 Cookie 积分不足，请更换后重试', 'status_code': 400}}
+                                backend_error = extract_backend_error(result)
+                                break
+
+                            raise FileNotFoundError(f'Assigned cookie not found: {current_cookie}')
+
+                        with task.lock:
+                            task.assigned_cookie = replacement_cookie
+                        self._save_task_to_db(task)
+                        continue
+                    args.cookie_file = assigned_cookie_path
+                else:
+                    replacement_cookie, replacement_diagnostics = choose_cookie_for_required_credits(
+                        required_credits,
+                        current_task=task,
+                    )
+                    if not replacement_cookie:
+                        if replacement_diagnostics.get('eligible_cookies'):
+                            result = {'error': {'code': 'system_busy', 'message': SYSTEM_BUSY_ERROR_MESSAGE, 'status_code': 503}}
+                        else:
+                            result = {'error': {'code': 'insufficient_credits', 'message': '可用 Cookie 积分不足，请更换后重试', 'status_code': 400}}
+                        backend_error = extract_backend_error(result)
+                        break
+
+                    with task.lock:
+                        task.assigned_cookie = replacement_cookie
+                    self._save_task_to_db(task)
+                    continue
+
+                attempted_cookies.add(task.assigned_cookie)
+                result = xiaoyunque_main(args)
+                backend_error = extract_backend_error(result)
+
+                if backend_error and backend_error.get('code') == 'insufficient_credits':
+                    replacement_cookie, replacement_diagnostics = choose_cookie_for_required_credits(
+                        required_credits,
+                        exclude_cookies=attempted_cookies,
+                        current_task=task,
+                    )
+                    if replacement_cookie:
+                        with task.lock:
+                            task.assigned_cookie = replacement_cookie
+                        self._save_task_to_db(task)
+                        continue
+                    if replacement_diagnostics.get('eligible_cookies'):
+                        result = {'error': {'code': 'system_busy', 'message': SYSTEM_BUSY_ERROR_MESSAGE, 'status_code': 503}}
+                        backend_error = extract_backend_error(result)
+
+                break
 
             video_files = []
             for file in os.listdir(task.output_dir):
@@ -1219,47 +1550,113 @@ def create_task_from_request(openai_compat: bool = False):
 
     file_param_name = 'input_reference[]' if openai_compat else 'files'
     backend_model = resolve_backend_model(model)
-    required_credits = MODEL_CREDITS_PER_SEC.get(backend_model, 5) * duration
+    required_credits = calculate_required_credits(backend_model, duration)
     output_dir = None
     try:
-        precheck_args = argparse.Namespace(
-            prompt=prompt,
-            ref_images=uploaded_files,
-            duration=duration,
-            ratio=ratio,
-            model=backend_model,
-            cookies=COOKIES_DIR,
-            output='.',
-            dry_run=False,
-            cookie_index=None,
-            cookie_file=None,
-        )
-        precheck_result = xiaoyunque_precheck(precheck_args)
-        precheck_error = extract_backend_error(precheck_result)
-        if precheck_error:
-            raise backend_error_to_api_error(precheck_error, param=file_param_name)
+        credit_statuses = inspect_cookies_for_required_credits(required_credits, cookies_files)
+        excluded_cookies = set()
 
-        output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
-        os.makedirs(output_dir, exist_ok=True)
+        while True:
+            selected_cookie, cookie_diagnostics = choose_cookie_for_required_credits(
+                required_credits,
+                exclude_cookies=excluded_cookies,
+                credit_statuses=credit_statuses,
+            )
+            eligible_cookies = cookie_diagnostics.get('eligible_cookies') or []
+            assignable_cookies = cookie_diagnostics.get('assignable_cookies') or []
+            if not selected_cookie:
+                if eligible_cookies:
+                    raise APIError(
+                        SYSTEM_BUSY_ERROR_MESSAGE,
+                        status_code=503,
+                        param=file_param_name,
+                        code='system_busy',
+                        error_type='server_error',
+                    )
 
-        for i, img_path in enumerate(uploaded_files):
-            shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
+                available_cookie_exists = any(
+                    item.get('available')
+                    for item in cookie_diagnostics.get('details', {}).values()
+                )
+                if available_cookie_exists:
+                    raise APIError(
+                        '可用 Cookie 积分不足，请更换后重试',
+                        status_code=400,
+                        param=file_param_name,
+                        code='insufficient_credits',
+                    )
+                raise APIError(
+                    '没有可用的 Cookie，请检查账号状态后重试',
+                    status_code=503,
+                    param=file_param_name,
+                    code='cookies_unavailable',
+                    error_type='server_error',
+                )
 
-        final_images = [
-            os.path.join(output_dir, f"ref_{i}_{os.path.basename(path)}")
-            for i, path in enumerate(uploaded_files)
-        ]
+            precheck_args = argparse.Namespace(
+                prompt=prompt,
+                ref_images=uploaded_files,
+                duration=duration,
+                ratio=ratio,
+                model=backend_model,
+                cookies=COOKIES_DIR,
+                output='.',
+                dry_run=False,
+                cookie_index=None,
+                cookie_file=None,
+                cookie_files=[os.path.join(COOKIES_DIR, cookie_name) for cookie_name in assignable_cookies],
+                return_selected_cookie=True,
+            )
+            precheck_result = xiaoyunque_precheck(precheck_args)
+            precheck_error = extract_backend_error(precheck_result)
+            if precheck_error:
+                raise backend_error_to_api_error(precheck_error, param=file_param_name)
 
-        task_id = task_manager.add_task(
-            prompt=prompt,
-            duration=duration,
-            ratio=ratio,
-            model=model,
-            ref_images=final_images,
-            output_dir=output_dir,
-            size=size,
-            quality=str(data.get('quality') or 'standard').strip() or 'standard',
-        )
+            prechecked_cookie = resolve_precheck_cookie_name(precheck_result) or selected_cookie
+            if not prechecked_cookie:
+                raise APIError(
+                    '创建视频前的安全预检失败，请稍后重试',
+                    status_code=500,
+                    param=file_param_name,
+                    code='video_precheck_failed',
+                    error_type='server_error',
+                )
+
+            output_dir = os.path.join(UPLOAD_FOLDER, str(uuid.uuid4()))
+            os.makedirs(output_dir, exist_ok=True)
+
+            for i, img_path in enumerate(uploaded_files):
+                shutil.copy(img_path, os.path.join(output_dir, f"ref_{i}_{os.path.basename(img_path)}"))
+
+            final_images = [
+                os.path.join(output_dir, f"ref_{i}_{os.path.basename(path)}")
+                for i, path in enumerate(uploaded_files)
+            ]
+
+            try:
+                task_id = task_manager.add_task(
+                    prompt=prompt,
+                    duration=duration,
+                    ratio=ratio,
+                    model=model,
+                    ref_images=final_images,
+                    output_dir=output_dir,
+                    size=size,
+                    quality=str(data.get('quality') or 'standard').strip() or 'standard',
+                    assigned_cookie=prechecked_cookie,
+                    eligible_cookies=[prechecked_cookie],
+                    required_credits=required_credits,
+                    credit_statuses=credit_statuses,
+                )
+                break
+            except APIError as exc:
+                if output_dir:
+                    shutil.rmtree(output_dir, ignore_errors=True)
+                    output_dir = None
+                if exc.code in {'system_busy', 'insufficient_credits'} and prechecked_cookie not in excluded_cookies:
+                    excluded_cookies.add(prechecked_cookie)
+                    continue
+                raise
     except Exception:
         if output_dir:
             shutil.rmtree(output_dir, ignore_errors=True)

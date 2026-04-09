@@ -697,10 +697,87 @@ async def precheck_with_cookie(prompt, ref_images, cookie_index, cookies_file):
             pass
 
 
+async def inspect_cookie_credits(cookie_index, cookies_file, required_credits=None):
+    log(f'[*] 检查 Cookie #{cookie_index + 1}: {os.path.basename(cookies_file)}')
+
+    p = None
+    b = None
+    ctx = None
+    result = {
+        'cookie_index': cookie_index,
+        'cookie_name': os.path.basename(cookies_file),
+        'cookie_file': cookies_file,
+        'credits': None,
+        'required_credits': required_credits,
+        'enough': None,
+        'available': False,
+        'error_code': None,
+    }
+
+    try:
+        p = await async_playwright().start()
+        b = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        ctx = await b.new_context(viewport={'width': 1920, 'height': 1080})
+        cookies = load_cookies(cookies_file)
+        await ctx.add_cookies(cookies)
+        page = await ctx.new_page()
+
+        try:
+            await asyncio.wait_for(
+                page.goto('https://xyq.jianying.com/home', wait_until='domcontentloaded'),
+                timeout=PAGE_LOAD_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log('[WARN] 积分检查页面加载超时，继续尝试')
+        await page.wait_for_timeout(5000)
+
+        ws_resp = json.loads(await api_post(page, '/api/web/v1/workspace/get_user_workspace', {}))
+        if str(ws_resp.get('ret')) != '0':
+            log('[WARN] Cookie 无法获取 workspace，可能已失效')
+            result['error_code'] = 'workspace_unavailable'
+            result['error'] = ws_resp
+            return result
+
+        credits = await get_credits_info(page)
+        result['available'] = True
+        result['credits'] = credits
+        if required_credits is not None:
+            result['enough'] = credits is not None and credits >= required_credits
+        else:
+            result['enough'] = credits is not None
+        return result
+
+    except Exception as e:
+        traceback.print_exc()
+        log(f'[WARN] Cookie 积分检查失败: {e}')
+        result['error_code'] = 'credits_check_failed'
+        result['error'] = str(e)
+        return result
+    finally:
+        try:
+            if ctx is not None:
+                await ctx.close()
+        except Exception:
+            pass
+        try:
+            if b is not None:
+                await b.close()
+        except Exception:
+            pass
+        try:
+            if p is not None:
+                await p.stop()
+        except Exception:
+            pass
+
+
 def resolve_cookie_files(args):
     cookies_files = []
+    assigned_cookie_files = getattr(args, 'cookie_files', None)
     assigned_cookie_file = getattr(args, 'cookie_file', None)
-    if assigned_cookie_file:
+    if assigned_cookie_files:
+        cookies_files = list(assigned_cookie_files)
+    elif assigned_cookie_file:
         cookies_files = [assigned_cookie_file]
     elif args.cookie_index is not None:
         cookie_files_all = get_cookies_files()
@@ -725,7 +802,20 @@ def resolve_cookie_files(args):
     return resolved_files
 
 
+async def inspect_cookies(args):
+    required_credits = getattr(args, 'required_credits', None)
+    results = []
+    for idx, cookies_path in enumerate(resolve_cookie_files(args)):
+        results.append(await inspect_cookie_credits(
+            cookie_index=idx,
+            cookies_file=cookies_path,
+            required_credits=required_credits,
+        ))
+    return results
+
+
 async def precheck(args):
+    return_selected_cookie = bool(getattr(args, 'return_selected_cookie', False))
     for idx, cookies_path in enumerate(resolve_cookie_files(args)):
         result = await precheck_with_cookie(
             prompt=args.prompt,
@@ -735,6 +825,13 @@ async def precheck(args):
         )
 
         if result is True:
+            if return_selected_cookie:
+                return {
+                    'precheck_ok': True,
+                    'cookie_index': idx,
+                    'cookie_name': os.path.basename(cookies_path),
+                    'cookie_file': cookies_path,
+                }
             return True
         if is_error_result(result):
             return result
@@ -857,6 +954,11 @@ def precheck_wrapper(args):
                 raise ValueError(f'图片过大: {img} ({os.path.getsize(img) / 1024 / 1024:.1f}MB, 最大20MB)')
 
     return asyncio.run(precheck(args))
+
+
+def inspect_cookies_wrapper(args):
+    """检查一个或多个 Cookie 的实时积分和可用性。"""
+    return asyncio.run(inspect_cookies(args))
 
 
 if __name__ == '__main__':
