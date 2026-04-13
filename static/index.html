@@ -1,0 +1,1244 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>小云雀 - 视频生成管理</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f0f; color: #fff; min-height: 100vh; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid #333; margin-bottom: 30px; }
+        header h1 { font-size: 24px; color: #ff6b9d; }
+        .header-right { display: flex; gap: 10px; align-items: center; }
+        .debug-badge { padding: 4px 12px; background: #9c27b0; color: #fff; border-radius: 4px; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+        .debug-badge:hover { background: #7b1fa2; }
+        .debug-toggle { display: flex; align-items: center; gap: 8px; }
+        .debug-toggle .toggle-switch { position: relative; width: 44px; height: 24px; }
+        .debug-toggle .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .debug-toggle .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: 0.3s; border-radius: 24px; }
+        .debug-toggle .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: 0.3s; border-radius: 50%; }
+        .debug-toggle input:checked + .slider { background-color: #9c27b0; }
+        .debug-toggle input:checked + .slider:before { transform: translateX(20px); }
+        .debug-label { font-size: 12px; color: #888; }
+        .debug-info { font-size: 14px; cursor: pointer; opacity: 0.6; transition: opacity 0.2s; }
+        .debug-info:hover { opacity: 1; }
+        .stats-bar { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
+        .stat-card { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 16px 24px; min-width: 100px; }
+        .stat-card .label { font-size: 12px; color: #888; margin-bottom: 4px; }
+        .stat-card .value { font-size: 28px; font-weight: bold; }
+        .stat-card.pending .value { color: #ffa500; }
+        .stat-card.running .value { color: #4da6ff; }
+        .stat-card.success .value { color: #4caf50; }
+        .stat-card.failed .value { color: #f44336; }
+        .stat-card.cookies .value { color: #9c27b0; }
+        .tabs { display: flex; gap: 4px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab { padding: 12px 24px; background: #1a1a1a; border: none; border-radius: 8px 8px 0 0; color: #888; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+        .tab:hover { color: #fff; }
+        .tab.active { background: #1a1a1a; color: #ff6b9d; border-bottom: 2px solid #ff6b9d; }
+        .panel { background: #1a1a1a; border-radius: 0 12px 12px 12px; padding: 24px; border: 1px solid #333; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+        .form-group { display: flex; flex-direction: column; gap: 6px; }
+        .form-group label { font-size: 12px; color: #888; }
+        .form-group input, .form-group select, .form-group textarea { background: #0f0f0f; border: 1px solid #333; border-radius: 8px; padding: 12px; color: #fff; font-size: 14px; }
+        .form-group textarea { resize: vertical; min-height: 80px; }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus { outline: none; border-color: #ff6b9d; }
+        .image-upload { border: 2px dashed #333; border-radius: 12px; padding: 30px; text-align: center; cursor: pointer; transition: all 0.2s; }
+        .image-upload:hover { border-color: #ff6b9d; }
+        .image-upload.has-images { border-style: solid; border-color: #4caf50; }
+        .image-preview { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+        .image-preview img { width: 80px; height: 80px; object-fit: cover; border-radius: 8px; cursor: pointer; opacity: 0.7; transition: opacity 0.2s; }
+        .image-preview img:hover { opacity: 1; }
+        .btn { padding: 12px 24px; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.2s; }
+        .btn-primary { background: #ff6b9d; color: #fff; }
+        .btn-primary:hover { background: #ff5087; }
+        .btn-primary:disabled { background: #555; cursor: not-allowed; }
+        .btn-secondary { background: #333; color: #fff; }
+        .btn-secondary:hover { background: #444; }
+        .btn-danger { background: #f44336; color: #fff; }
+        .btn-danger:hover { background: #d32f2f; }
+        .btn-small { padding: 6px 12px; font-size: 12px; }
+        .btn-success { background: #4caf50; color: #fff; }
+        .btn-success:hover { background: #388e3c; }
+        .task-list { margin-top: 20px; }
+        .task-item { background: #0f0f0f; border: 1px solid #333; border-radius: 12px; padding: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; }
+        .task-item .status { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+        .task-item .status.pending { background: #ffa500; }
+        .task-item .status.running { background: #4da6ff; animation: pulse 1.5s infinite; }
+        .task-item .status.success { background: #4caf50; }
+        .task-item .status.failed { background: #f44336; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .task-item .info { flex: 1; min-width: 0; }
+        .task-item .prompt { font-size: 14px; margin-bottom: 4px; word-break: break-word; line-height: 1.5; }
+        .task-item .meta { font-size: 12px; color: #888; }
+        .task-item .progress-bar { flex: 1; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
+        .task-item .progress-fill { height: 100%; background: #ff6b9d; transition: width 0.3s; }
+        .task-item .actions { display: flex; gap: 8px; flex-shrink: 0; }
+        .task-ref-images { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+        .task-ref-images img { width: 60px; height: 60px; object-fit: cover; border-radius: 6px; border: 1px solid #333; }
+        .modal { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 1000; align-items: center; justify-content: center; }
+        .modal.show { display: flex; }
+        .modal-content { background: #1a1a1a; border-radius: 16px; padding: 24px; max-width: 800px; width: 90%; max-height: 90vh; overflow-y: auto; }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+        .modal-header h2 { font-size: 18px; }
+        .modal-close { background: none; border: none; color: #888; font-size: 24px; cursor: pointer; }
+        .modal-close:hover { color: #fff; }
+        video { width: 100%; border-radius: 8px; margin-top: 10px; }
+        .empty { text-align: center; padding: 60px 20px; color: #666; }
+        .toast { position: fixed; bottom: 20px; right: 20px; background: #333; color: #fff; padding: 16px 24px; border-radius: 8px; z-index: 2000; transform: translateY(100px); opacity: 0; transition: all 0.3s; }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.success { background: #4caf50; }
+        .toast.error { background: #f44336; }
+        .loading { display: inline-block; width: 20px; height: 20px; border: 2px solid #333; border-top-color: #ff6b9d; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; margin-right: 8px; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .cookie-list { margin-top: 20px; }
+        .cookie-item { background: #0f0f0f; border: 1px solid #333; border-radius: 12px; padding: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 16px; }
+        .cookie-item .icon { width: 40px; height: 40px; background: #9c27b0; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 20px; }
+        .cookie-item .info { flex: 1; }
+        .cookie-item .name { font-size: 14px; margin-bottom: 4px; }
+        .cookie-item .meta { font-size: 12px; color: #888; }
+        .cookie-item .credits { font-size: 16px; color: #ffa500; font-weight: bold; }
+        .cookie-upload { border: 2px dashed #333; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all 0.2s; margin-top: 20px; }
+        .cookie-upload:hover { border-color: #9c27b0; }
+        .credits-info { background: #1a1a1a; border: 1px solid #333; border-radius: 12px; padding: 16px; margin-bottom: 20px; }
+        .credits-info h3 { font-size: 14px; color: #888; margin-bottom: 12px; }
+        .credits-table { width: 100%; font-size: 13px; }
+        .credits-table td { padding: 6px 0; }
+        .credits-table td:first-child { color: #ff6b9d; }
+        .credits-table td:last-child { color: #888; text-align: right; }
+        .required-credits { font-size: 12px; color: #888; margin-top: 8px; }
+        .api-section { margin-bottom: 24px; }
+        .api-section h4 { font-size: 15px; padding-bottom: 8px; border-bottom: 1px solid #333; }
+        .api-item { background: #0f0f0f; border: 1px solid #333; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+        .api-method { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+        .method { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; color: #fff; }
+        .method.get { background: #4caf50; }
+        .method.post { background: #4da6ff; }
+        .method.delete { background: #f44336; }
+        .method.put { background: #ffa500; }
+        .api-path { font-family: 'Courier New', monospace; font-size: 13px; color: #ff6b9d; }
+        .api-desc { font-size: 13px; color: #ccc; margin-bottom: 8px; }
+        .api-params { margin: 8px 0; }
+        .params-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
+        .params-table th, .params-table td { padding: 6px 10px; border: 1px solid #333; text-align: left; }
+        .params-table th { background: #1a1a1a; color: #888; font-weight: 500; }
+        .params-table td { color: #ccc; }
+        .api-response { background: #111; border: 1px solid #222; border-radius: 6px; padding: 12px; font-family: 'Courier New', monospace; font-size: 11px; color: #4caf50; overflow-x: auto; margin-top: 8px; white-space: pre-wrap; word-break: break-all; }
+        .code-block { background: #111; border: 1px solid #222; border-radius: 6px; padding: 12px; font-family: 'Courier New', monospace; font-size: 11px; color: #ccc; overflow-x: auto; margin-top: 8px; white-space: pre; line-height: 1.6; }
+        .api-doc-tab { opacity: 0.6; }
+        .api-doc-tab.active { opacity: 1; border-bottom: 2px solid #ff6b9d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div style="display: flex; align-items: center; gap: 16px;">
+                <h1>🎬 小云雀 - 视频生成管理</h1>
+            </div>
+            <div class="header-right">
+                <div class="debug-toggle">
+                    <span class="debug-label">调试模式</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="debug-toggle" onchange="toggleDebugMode(this.checked)">
+                        <span class="slider"></span>
+                    </label>
+                    <span class="debug-info" title="调试模式说明" onclick="showDebugInfo()">❓</span>
+                </div>
+                <button class="btn btn-secondary" onclick="checkHealth()">检查服务</button>
+                <button class="btn btn-secondary" onclick="loadStats()">刷新</button>
+            </div>
+        </header>
+
+        <div class="stats-bar">
+            <div class="stat-card pending">
+                <div class="label">等待中</div>
+                <div class="value" id="stat-pending">0</div>
+            </div>
+            <div class="stat-card running">
+                <div class="label">生成中</div>
+                <div class="value" id="stat-running">0</div>
+            </div>
+            <div class="stat-card success">
+                <div class="label">已完成</div>
+                <div class="value" id="stat-success">0</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="label">失败</div>
+                <div class="value" id="stat-failed">0</div>
+            </div>
+            <div class="stat-card cookies">
+                <div class="label">Cookies</div>
+                <div class="value" id="stat-cookies">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" data-tab="create" onclick="switchTab('create')">创建任务</button>
+            <button class="tab" data-tab="tasks" onclick="switchTab('tasks')">任务列表</button>
+            <button class="tab" data-tab="cookies" onclick="switchTab('cookies')">Cookie 管理</button>
+            <button class="tab" data-tab="settings" onclick="switchTab('settings')">⚙️ 设置</button>
+            <button class="tab" data-tab="api-docs" onclick="switchTab('api-docs')">API 文档</button>
+        </div>
+
+        <div class="panel" id="panel-create">
+            <div class="credits-info">
+                <h3>📊 积分消耗参考</h3>
+                <table class="credits-table">
+                    <tr><td>Seedance 2.0 Fast</td><td>5 积分/秒 (生成速度更快)</td></tr>
+                    <tr><td>Seedance 2.0 满血版</td><td>8 积分/秒 (生成质量更高)</td></tr>
+                </table>
+            </div>
+
+            <form id="create-form" onsubmit="createTask(event)">
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>提示词</label>
+                        <textarea name="prompt" placeholder="描述视频内容，如：阳光下的海边，一个女孩在跳舞" required></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>参数设置</label>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
+                            <select name="duration" id="duration-select" onchange="updateRequiredCredits()">
+                                <option value="5">5秒</option>
+                                <option value="10" selected>10秒</option>
+                                <option value="15">15秒</option>
+                            </select>
+                            <select name="ratio" id="ratio-select">
+                                <option value="16:9">横屏 16:9</option>
+                                <option value="9:16">竖屏 9:16</option>
+                            </select>
+                            <select name="model" id="model-select" onchange="updateRequiredCredits()">
+                                <option value="seedance-2.0-fast" selected>Seedance 2.0 Fast</option>
+                                <option value="seedance-2.0">Seedance 2.0 满血版</option>
+                            </select>
+                        </div>
+                        <div class="required-credits" id="required-credits">预计消耗: 50 积分</div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>参考图片（至少上传1张）</label>
+                    <div class="image-upload" id="image-upload" onclick="document.getElementById('file-input').click()">
+                        <div id="upload-placeholder">点击或拖拽图片到此处上传</div>
+                        <div class="image-preview" id="image-preview"></div>
+                        <input type="file" id="file-input" accept="image/*" multiple style="display: none;" onchange="handleFileSelect(event)">
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary" id="submit-btn">
+                    <span id="submit-text">创建视频生成任务</span>
+                </button>
+            </form>
+        </div>
+
+        <div class="panel" id="panel-tasks" style="display: none;">
+            <div style="margin-bottom: 16px; display: flex; gap: 10px; flex-wrap: wrap;">
+                <select id="filter-status" onchange="loadTasks()" style="background: #0f0f0f; border: 1px solid #333; border-radius: 8px; padding: 8px 12px; color: #fff;">
+                    <option value="">全部状态</option>
+                    <option value="pending">等待中</option>
+                    <option value="running">生成中</option>
+                    <option value="success">已完成</option>
+                    <option value="failed">失败</option>
+                </select>
+                <button class="btn btn-danger btn-small" onclick="clearAllTasks()">清空所有任务</button>
+            </div>
+            <div id="task-list" class="task-list"></div>
+        </div>
+
+        <div class="panel" id="panel-cookies" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+                <h3 style="color: #ff6b9d;">Cookie 管理</h3>
+                <button id="check-all-cookies-btn" class="btn btn-success" onclick="checkAllCookies()">一键查询所有账号积分</button>
+            </div>
+            <div class="cookie-upload" onclick="document.getElementById('cookie-file-input').click()">
+                <div id="cookie-upload-placeholder">点击上传 Cookie JSON 文件</div>
+                <div style="font-size: 12px; color: #888; margin-top: 8px;">支持多账号切换，积分不足时自动使用下一个</div>
+                <input type="file" id="cookie-file-input" accept=".json" style="display: none;" onchange="handleCookieFileSelect(event)">
+            </div>
+
+            <div style="margin-top: 16px;">
+                <input type="text" id="cookie-name-input" placeholder="Cookie 名称（可选，如：账号1）" style="background: #0f0f0f; border: 1px solid #333; border-radius: 8px; padding: 12px; color: #fff; width: 300px; margin-right: 10px;">
+                <button class="btn btn-secondary" onclick="uploadCookieByPaste()">粘贴上传</button>
+            </div>
+
+            <div id="cookie-list" class="cookie-list"></div>
+        </div>
+
+        <div class="panel" id="panel-settings" style="display: none;">
+            <div style="margin-bottom: 20px;">
+                <h3 style="color: #ff6b9d; margin-bottom: 8px;">⚙️ 系统设置</h3>
+                <p style="color: #888; font-size: 13px;">运行时可调整的配置参数，修改后立即生效，重启后恢复为环境变量或默认值。</p>
+            </div>
+
+            <div style="background: #0f0f0f; border: 1px solid #333; border-radius: 12px; padding: 20px; margin-bottom: 16px;">
+                <h4 style="color: #4da6ff; margin-bottom: 16px;">⏱️ 任务超时时间</h4>
+                <p style="color: #888; font-size: 13px; margin-bottom: 12px;">
+                    单个视频生成任务的最大执行时间。超过此时间后，任务会被强制标记为失败。<br>
+                    小云雀官方服务繁忙时，单个视频可能需要 60 分钟以上，建议适当调大此值。
+                </p>
+                <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                    <label style="color: #888; font-size: 13px; white-space: nowrap;">超时时间：</label>
+                    <input type="number" id="setting-task-timeout" min="60" max="7200" step="60"
+                        style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 10px 14px; color: #fff; width: 120px; font-size: 16px;"
+                        placeholder="1200">
+                    <span style="color: #888; font-size: 13px;">秒</span>
+                    <div style="display: flex; gap: 6px; margin-left: 8px;">
+                        <button class="btn btn-small btn-secondary" onclick="setTaskTimeoutQuick(600)">10分钟</button>
+                        <button class="btn btn-small btn-secondary" onclick="setTaskTimeoutQuick(1200)">20分钟</button>
+                        <button class="btn btn-small btn-secondary" onclick="setTaskTimeoutQuick(1800)">30分钟</button>
+                        <button class="btn btn-small btn-secondary" onclick="setTaskTimeoutQuick(3600)">60分钟</button>
+                    </div>
+                </div>
+                <div style="margin-top: 12px; display: flex; align-items: center; gap: 10px;">
+                    <span style="color: #888; font-size: 12px;">当前值：<span id="current-timeout-display" style="color: #4da6ff; font-weight: bold;">--</span></span>
+                    <button class="btn btn-primary btn-small" onclick="saveTaskTimeout()">保存</button>
+                </div>
+            </div>
+
+            <div style="background: #0f0f0f; border: 1px solid #333; border-radius: 12px; padding: 20px;">
+                <h4 style="color: #9c27b0; margin-bottom: 16px;">📋 当前配置</h4>
+                <table class="params-table" style="font-size: 13px;">
+                    <tr><th style="width: 160px;">配置项</th><th>当前值</th><th>说明</th></tr>
+                    <tr><td>task_timeout</td><td id="settings-timeout-val">--</td><td>单任务最大执行时间</td></tr>
+                    <tr><td>max_workers</td><td id="settings-workers-val">--</td><td>最大并发任务数（需重启）</td></tr>
+                    <tr><td>debug_mode</td><td id="settings-debug-val">--</td><td>调试模式（可切换）</td></tr>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel" id="panel-api-docs" style="display: none;">
+            <div style="margin-bottom: 20px;">
+                <h3 style="color: #ff6b9d; margin-bottom: 8px;">API 接口文档</h3>
+                <p style="color: #888; font-size: 13px;">Base URL: <code id="api-base-url" style="background: #0f0f0f; padding: 2px 8px; border-radius: 4px; color: #4da6ff;"></code></p>
+            </div>
+
+            <div style="margin-bottom: 16px;">
+                <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+                    <button class="btn btn-secondary btn-small api-doc-tab active" data-apitab="legacy" onclick="switchApiDocTab('legacy')">传统 API</button>
+                    <button class="btn btn-secondary btn-small api-doc-tab" data-apitab="openai" onclick="switchApiDocTab('openai')">OpenAI 兼容 API</button>
+                </div>
+
+                <div id="apidoc-legacy">
+                    <div class="api-section">
+                        <h4 style="color: #ffa500; margin-bottom: 12px;">🔧 系统接口</h4>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/health</span></div>
+                            <div class="api-desc">健康检查，返回服务状态和配置信息</div>
+                            <div class="api-response">{ "status": "healthy", "version": "3.0.0", "max_workers": 5, "running_tasks": 0, "cookies_count": 1, "debug_mode": false }</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/stats</span></div>
+                            <div class="api-desc">获取任务统计数据</div>
+                            <div class="api-response">{ "status": "success", "stats": { "pending": 0, "running": 1, "success": 5, "failed": 0 }, "total": 6, "running": 1, "cookies_count": 1 }</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/debug-mode</span></div>
+                            <div class="api-desc">查询调试模式状态</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/debug-mode</span></div>
+                            <div class="api-desc">切换调试模式</div>
+                            <div class="api-params">Body: { "enabled": true }</div>
+                        </div>
+                    </div>
+
+                    <div class="api-section">
+                        <h4 style="color: #4da6ff; margin-bottom: 12px;">📋 任务管理</h4>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/generate-video</span></div>
+                            <div class="api-desc">提交视频生成任务（multipart/form-data）</div>
+                            <div class="api-params">
+                                <table class="params-table">
+                                    <tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr>
+                                    <tr><td>prompt</td><td>string</td><td>✅</td><td>视频描述提示词</td></tr>
+                                    <tr><td>duration</td><td>int</td><td>✅</td><td>时长：5 / 10 / 15 秒</td></tr>
+                                    <tr><td>ratio</td><td>string</td><td>✅</td><td>比例：16:9 / 9:16</td></tr>
+                                    <tr><td>model</td><td>string</td><td>✅</td><td>seedance-2.0-fast / seedance-2.0</td></tr>
+                                    <tr><td>files</td><td>file[]</td><td>✅</td><td>参考图片（至少1张）</td></tr>
+                                </table>
+                            </div>
+                            <div class="api-response">{ "status": "success", "task_id": "uuid", "message": "视频生成任务已提交", "required_credits": 50, "running_tasks": 1 }</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/task/{task_id}</span></div>
+                            <div class="api-desc">查询任务状态</div>
+                            <div class="api-response">{ "task_id": "uuid", "prompt": "...", "status": "running", "progress": 45, "video_path": null }</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/task/{task_id}/retry</span></div>
+                            <div class="api-desc">重试失败的任务</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method delete">DELETE</span> <span class="api-path">/api/task/{task_id}</span></div>
+                            <div class="api-desc">删除任务（运行中的任务无法删除）</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/tasks?status=&limit=100&offset=0</span></div>
+                            <div class="api-desc">列出所有任务（支持按状态筛选和分页）</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/tasks/clear</span></div>
+                            <div class="api-desc">清空所有任务（运行中的任务不会被清空）</div>
+                        </div>
+                    </div>
+
+                    <div class="api-section">
+                        <h4 style="color: #4caf50; margin-bottom: 12px;">🎬 资源获取</h4>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/video/{task_id}</span></div>
+                            <div class="api-desc">下载生成的视频文件（MP4 文件流）</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/image/{image_path}</span></div>
+                            <div class="api-desc">获取参考图片（相对路径）</div>
+                        </div>
+                    </div>
+
+                    <div class="api-section">
+                        <h4 style="color: #9c27b0; margin-bottom: 12px;">🍪 Cookie 管理</h4>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/api/cookies</span></div>
+                            <div class="api-desc">获取所有 Cookie 列表</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/cookies</span></div>
+                            <div class="api-desc">上传 Cookie（支持文件上传或 JSON 内容）</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/cookies/{name}/test</span></div>
+                            <div class="api-desc">测试单个 Cookie 的剩余积分</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/api/cookies/check-all</span></div>
+                            <div class="api-desc">批量查询所有 Cookie 积分</div>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-method"><span class="method delete">DELETE</span> <span class="api-path">/api/cookies/{name}</span></div>
+                            <div class="api-desc">删除指定 Cookie</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="apidoc-openai" style="display: none;">
+                    <div class="api-section">
+                        <h4 style="color: #4da6ff; margin-bottom: 12px;">🤖 OpenAI 兼容 API</h4>
+                        <p style="color: #888; font-size: 13px; margin-bottom: 16px;">完全兼容 OpenAI API 格式，可直接对接现有客户端和工具链。</p>
+
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/v1/models</span></div>
+                            <div class="api-desc">获取可用模型列表</div>
+                            <div class="api-response">{ "object": "list", "data": [{ "id": "seedance-2.0-fast", "object": "model" }, { "id": "seedance-2.0", "object": "model" }] }</div>
+                        </div>
+
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/v1/videos/generations</span></div>
+                            <div class="api-desc">提交视频生成任务（同步/异步均可）</div>
+                            <div class="api-params">
+                                <table class="params-table">
+                                    <tr><th>参数</th><th>类型</th><th>必填</th><th>说明</th></tr>
+                                    <tr><td>model</td><td>string</td><td>否</td><td>seedance-2.0-fast / seedance-2.0</td></tr>
+                                    <tr><td>prompt</td><td>string</td><td>✅</td><td>视频描述</td></tr>
+                                    <tr><td>duration</td><td>int</td><td>否</td><td>5 / 10 / 15 秒（默认10）</td></tr>
+                                    <tr><td>ratio</td><td>string</td><td>否</td><td>16:9 / 9:16（默认16:9）</td></tr>
+                                    <tr><td>files</td><td>file[]</td><td>✅</td><td>参考图片（multipart）</td></tr>
+                                    <tr><td>file_paths</td><td>string[]</td><td>✅</td><td>图片URL数组（JSON模式）</td></tr>
+                                </table>
+                            </div>
+                            <div class="api-response">{ "created": 1700000000, "task_id": "uuid", "status": "processing", "message": "任务已提交" }</div>
+                        </div>
+
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/v1/videos/generations/{task_id}</span></div>
+                            <div class="api-desc">查询任务状态（OpenAI 格式）</div>
+                            <div class="api-response">{ "created": 1700000000, "task_id": "uuid", "status": "succeeded", "data": [{ "url": "/api/video/uuid", "revised_prompt": "提示词" }] }</div>
+                        </div>
+
+                        <div class="api-item">
+                            <div class="api-method"><span class="method post">POST</span> <span class="api-path">/v1/videos/generations/async</span></div>
+                            <div class="api-desc">异步提交任务（立即返回 task_id）</div>
+                            <div class="api-desc" style="color: #ffa500; font-size: 12px;">参数与 /v1/videos/generations 完全一致</div>
+                        </div>
+
+                        <div class="api-item">
+                            <div class="api-method"><span class="method get">GET</span> <span class="api-path">/v1/videos/generations/async/{task_id}?timeout=1200</span></div>
+                            <div class="api-desc">查询异步任务结果（服务端阻塞等待，最长 20 分钟）</div>
+                            <div class="api-desc" style="color: #ffa500; font-size: 12px;">无需客户端轮询，服务端自动等待至任务完成</div>
+                            <div class="api-response">{ "created": 1700000000, "task_id": "uuid", "status": "succeeded", "data": [{ "url": "/api/video/uuid", "revised_prompt": "提示词" }] }</div>
+                        </div>
+                    </div>
+
+                    <div class="api-section">
+                        <h4 style="color: #ffa500; margin-bottom: 12px;">💡 调用示例</h4>
+                        <div class="api-item">
+                            <div class="api-desc" style="margin-bottom: 8px;"><strong style="color: #4da6ff;">cURL 示例（multipart 上传）：</strong></div>
+                            <pre class="code-block">curl -X POST http://localhost:8033/v1/videos/generations \
+  -F "model=seedance-2.0-fast" \
+  -F "prompt=@1 图片中的人物开始微笑" \
+  -F "ratio=16:9" \
+  -F "duration=10" \
+  -F "files=@image1.jpg" \
+  -F "files=@image2.jpg"</pre>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-desc" style="margin-bottom: 8px;"><strong style="color: #4da6ff;">cURL 示例（JSON + 图片URL）：</strong></div>
+                            <pre class="code-block">curl -X POST http://localhost:8033/v1/videos/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "seedance-2.0-fast",
+    "prompt": "@1 图片中的人物开始微笑",
+    "ratio": "16:9",
+    "duration": 10,
+    "file_paths": ["https://example.com/image1.jpg"]
+  }'</pre>
+                        </div>
+                        <div class="api-item">
+                            <div class="api-desc" style="margin-bottom: 8px;"><strong style="color: #4da6ff;">异步查询示例：</strong></div>
+                            <pre class="code-block"># 1. 提交任务（立即返回）
+curl -X POST http://localhost:8033/v1/videos/generations/async \
+  -F "model=seedance-2.0-fast" \
+  -F "prompt=描述" \
+  -F "files=@image.jpg"
+
+# 2. 查询结果（服务端阻塞等待）
+curl http://localhost:8033/v1/videos/generations/async/{task_id}</pre>
+                        </div>
+                    </div>
+
+                    <div class="api-section">
+                        <h4 style="color: #4caf50; margin-bottom: 12px;">📊 任务状态值</h4>
+                        <table class="params-table">
+                            <tr><th>状态</th><th>说明</th></tr>
+                            <tr><td>pending</td><td>等待中</td></tr>
+                            <tr><td>running</td><td>生成中</td></tr>
+                            <tr><td>success</td><td>已完成</td></tr>
+                            <tr><td>failed</td><td>失败</td></tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="video-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>视频预览</h2>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <video id="modal-video" controls></video>
+            <div style="margin-top: 16px; display: flex; gap: 10px;">
+                <a id="download-link" href="#" download class="btn btn-primary">下载视频</a>
+                <button class="btn btn-secondary" onclick="closeModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="paste-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>粘贴 Cookie JSON</h2>
+                <button class="modal-close" onclick="closePasteModal()">&times;</button>
+            </div>
+            <textarea id="cookie-paste-area" placeholder="粘贴 Cookie JSON 内容..." style="width: 100%; min-height: 300px; background: #0f0f0f; border: 1px solid #333; border-radius: 8px; padding: 12px; color: #fff; font-family: monospace; font-size: 12px; resize: vertical;"></textarea>
+            <div style="margin-top: 16px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="closePasteModal()">取消</button>
+                <button class="btn btn-primary" onclick="submitPastedCookie()">确认上传</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="debug-info-modal">
+        <div class="modal-content" style="max-width: 500px;">
+            <div class="modal-header">
+                <h2>🔧 调试模式说明</h2>
+                <button class="modal-close" onclick="closeDebugInfo()">&times;</button>
+            </div>
+            <div style="line-height: 1.8; color: #ccc;">
+                <p style="margin-bottom: 16px;"><strong style="color: #ff6b9d;">调试模式</strong> 是一种特殊运行模式，用于在没有真实 AI 视频生成能力时，测试和验证整个视频生成工作流。</p>
+                
+                <p style="margin-bottom: 12px;"><strong>开启后会发生什么？</strong></p>
+                <ul style="margin-left: 20px; margin-bottom: 16px;">
+                    <li>✅ 跳过所有 AI 模型调用</li>
+                    <li>✅ 跳过真实视频生成流程</li>
+                    <li>✅ 直接返回本地示例视频</li>
+                    <li>✅ 快速完成整个任务流程</li>
+                </ul>
+                
+                <p style="margin-bottom: 12px;"><strong>适用场景？</strong></p>
+                <ul style="margin-left: 20px; margin-bottom: 16px;">
+                    <li>🚀 前端界面功能测试</li>
+                    <li>🚀 视频生成流程调试</li>
+                    <li>🚀 在没有积分/Cookie 时演示</li>
+                    <li>🚀 开发阶段快速验证</li>
+                </ul>
+                
+                <p style="margin-bottom: 12px;"><strong>关闭后呢？</strong></p>
+                <ul style="margin-left: 20px; margin-bottom: 16px;">
+                    <li>🔄 恢复正常视频生成流程</li>
+                    <li>🔄 需要有效的 Cookie 和积分</li>
+                    <li>🔄 会真实调用剪映 AI 服务</li>
+                </ul>
+                
+                <p style="color: #888; font-size: 12px; border-top: 1px solid #333; padding-top: 12px; margin-top: 16px;">
+                    💡 提示：调试模式开启后，所有新建任务都会使用本地示例视频，而不会消耗积分。
+                </p>
+            </div>
+            <div style="margin-top: 16px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-primary" onclick="closeDebugInfo()">知道了</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let selectedFiles = [];
+        let selectedCookieFile = null;
+        let BASE_DIR = '';
+
+        async function checkDebugMode() {
+            try {
+                const response = await fetch(`${API_BASE}/api/debug-mode`);
+                const result = await response.json();
+                if (result.status === 'success') {
+                    document.getElementById('debug-toggle').checked = result.debug_mode;
+                }
+            } catch (e) {
+                console.error('检查调试模式失败', e);
+            }
+        }
+
+        async function toggleDebugMode(enabled) {
+            try {
+                const response = await fetch(`${API_BASE}/api/debug-mode`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled })
+                });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    showToast(result.message, 'success');
+                } else {
+                    showToast(result.message || '切换失败', 'error');
+                    document.getElementById('debug-toggle').checked = !enabled;
+                }
+            } catch (e) {
+                console.error('切换调试模式失败', e);
+                showToast('切换调试模式失败', 'error');
+                document.getElementById('debug-toggle').checked = !enabled;
+            }
+        }
+
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast ${type} show`;
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }
+
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+            document.getElementById('panel-create').style.display = tab === 'create' ? 'block' : 'none';
+            document.getElementById('panel-tasks').style.display = tab === 'tasks' ? 'block' : 'none';
+            document.getElementById('panel-cookies').style.display = tab === 'cookies' ? 'block' : 'none';
+            document.getElementById('panel-settings').style.display = tab === 'settings' ? 'block' : 'none';
+            document.getElementById('panel-api-docs').style.display = tab === 'api-docs' ? 'block' : 'none';
+            if (tab === 'tasks') loadTasks();
+            if (tab === 'cookies') loadCookies();
+            if (tab === 'settings') loadSettings();
+            if (tab === 'api-docs') {
+                document.getElementById('api-base-url').textContent = API_BASE;
+            }
+        }
+
+        function switchApiDocTab(tab) {
+            document.querySelectorAll('.api-doc-tab').forEach(t => t.classList.remove('active'));
+            document.querySelector(`[data-apitab="${tab}"]`).classList.add('active');
+            document.getElementById('apidoc-legacy').style.display = tab === 'legacy' ? 'block' : 'none';
+            document.getElementById('apidoc-openai').style.display = tab === 'openai' ? 'block' : 'none';
+        }
+
+        function updateRequiredCredits() {
+            const duration = parseInt(document.getElementById('duration-select').value);
+            const model = document.getElementById('model-select').value;
+            const rate = model === 'seedance-2.0-fast' ? 5 : 8;
+            const total = duration * rate;
+            document.getElementById('required-credits').textContent = `预计消耗: ${total} 积分 (${rate}积分/秒 × ${duration}秒)`;
+        }
+
+        function handleFileSelect(event) {
+            const files = Array.from(event.target.files);
+            files.forEach(file => {
+                if (file.type.startsWith('image/')) {
+                    selectedFiles.push(file);
+                }
+            });
+            updateImagePreview();
+        }
+
+        function updateImagePreview() {
+            const preview = document.getElementById('image-preview');
+            const upload = document.getElementById('image-upload');
+            const placeholder = document.getElementById('upload-placeholder');
+
+            preview.innerHTML = '';
+            selectedFiles.forEach((file, index) => {
+                const img = document.createElement('img');
+                img.src = URL.createObjectURL(file);
+                img.title = '点击删除';
+                img.onclick = (e) => {
+                    e.stopPropagation();
+                    selectedFiles.splice(index, 1);
+                    updateImagePreview();
+                };
+                preview.appendChild(img);
+            });
+
+            if (selectedFiles.length > 0) {
+                upload.classList.add('has-images');
+                placeholder.textContent = `${selectedFiles.length} 张图片已选择`;
+            } else {
+                upload.classList.remove('has-images');
+                placeholder.textContent = '点击或拖拽图片到此处上传';
+            }
+        }
+
+        async function createTask(event) {
+            event.preventDefault();
+
+            if (selectedFiles.length === 0) {
+                showToast('请至少上传一张参考图片', 'error');
+                return;
+            }
+
+            const form = event.target;
+            const btn = document.getElementById('submit-btn');
+            const submitText = document.getElementById('submit-text');
+
+            btn.disabled = true;
+            submitText.innerHTML = '<span class="loading"></span>创建中...';
+
+            try {
+                const formData = new FormData();
+                formData.append('prompt', form.prompt.value);
+                formData.append('duration', form.duration.value);
+                formData.append('ratio', form.ratio.value);
+                formData.append('model', form.model.value);
+                selectedFiles.forEach(file => {
+                    formData.append('files', file);
+                });
+
+                const response = await fetch(`${API_BASE}/api/generate-video`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast('任务创建成功！', 'success');
+                    form.reset();
+                    selectedFiles = [];
+                    updateImagePreview();
+                    updateRequiredCredits();
+                    switchTab('tasks');
+                    loadStats();
+                } else {
+                    showToast(result.message || '创建失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误：' + error.message, 'error');
+            } finally {
+                btn.disabled = false;
+                submitText.textContent = '创建视频生成任务';
+            }
+        }
+
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_BASE}/api/stats`);
+                const result = await response.json();
+                if (result.status === 'success') {
+                    document.getElementById('stat-pending').textContent = result.stats.pending || 0;
+                    document.getElementById('stat-running').textContent = result.stats.running || 0;
+                    document.getElementById('stat-success').textContent = result.stats.success || 0;
+                    document.getElementById('stat-failed').textContent = result.stats.failed || 0;
+                    document.getElementById('stat-cookies').textContent = result.cookies_count || 0;
+                }
+            } catch (error) {
+                console.error('Failed to load stats:', error);
+            }
+        }
+
+        async function loadTasks() {
+            const list = document.getElementById('task-list');
+            const status = document.getElementById('filter-status').value;
+
+            try {
+                const url = status ? `${API_BASE}/api/tasks?status=${status}` : `${API_BASE}/api/tasks`;
+                const response = await fetch(url);
+                const result = await response.json();
+
+                if (!result.tasks || result.tasks.length === 0) {
+                    list.innerHTML = '<div class="empty">暂无任务</div>';
+                    return;
+                }
+
+                list.innerHTML = result.tasks.map(task => {
+                    let refImagesHtml = '';
+                    if (task.ref_images && task.ref_images.length > 0) {
+                        refImagesHtml = '<div class="task-ref-images">';
+                        task.ref_images.forEach((imgPath, idx) => {
+                            refImagesHtml += `<img src="${encodeURI(API_BASE + '/api/image/' + imgPath)}" title="图片 ${idx + 1}">`;
+                        });
+                        refImagesHtml += '</div>';
+                    }
+                    
+                    return `
+                    <div class="task-item" style="flex-direction: column; align-items: flex-start;">
+                        <div style="display: flex; width: 100%; align-items: center; gap: 16px;">
+                            <div class="status ${escapeHtml(task.status)}"></div>
+                            <div class="info">
+                                <div class="prompt">${escapeHtml(task.prompt)}</div>
+                                <div class="meta">
+                                    ${escapeHtml(String(task.duration))}s · ${escapeHtml(task.ratio)} · ${escapeHtml(task.model)}
+                                    · ${formatTime(task.created_at)}
+                                </div>
+                                ${task.status === 'running' ? `
+                                    <div class="progress-bar">
+                                        <div class="progress-fill" style="width: ${task.progress || 0}%"></div>
+                                    </div>
+                                ` : ''}
+                                ${task.error_message ? `<div class="meta" style="color:#f44336">错误：${escapeHtml(task.error_message)}</div>` : ''}
+                            </div>
+                            <div class="actions" style="margin-left: auto;">
+                                ${task.status === 'success' ? `
+                                    <button class="btn btn-primary btn-small" data-action="play" data-task-id="${escapeHtml(task.task_id)}">播放</button>
+                                ` : ''}
+                                ${task.status === 'failed' ? `
+                                    <button class="btn btn-secondary btn-small" data-action="retry" data-task-id="${escapeHtml(task.task_id)}">重试</button>
+                                ` : ''}
+                                <button class="btn btn-danger btn-small" data-action="delete" data-task-id="${escapeHtml(task.task_id)}">删除</button>
+                            </div>
+                        </div>
+                        ${refImagesHtml}
+                    </div>
+                `}).join('');
+            } catch (error) {
+                list.innerHTML = '<div class="empty">加载失败</div>';
+                showToast('加载任务列表失败', 'error');
+            }
+        }
+
+        async function loadCookies() {
+            const list = document.getElementById('cookie-list');
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies`);
+                const result = await response.json();
+
+                if (!result.cookies || result.cookies.length === 0) {
+                    list.innerHTML = '<div class="empty">暂无 Cookie，请上传</div>';
+                    return;
+                }
+
+                list.innerHTML = result.cookies.map((cookie, idx) => {
+                    const safeName = cookie.name.replace(/'/g, "\\'");
+                    const safeFilename = escapeHtml(cookie.filename);
+                    return `
+                    <div class="cookie-item">
+                        <div class="icon">👤</div>
+                        <div class="info">
+                            <div class="name">${escapeHtml(cookie.name)}</div>
+                            <div class="meta">${safeFilename} · ${formatFileSize(cookie.size)}</div>
+                        </div>
+                        <div class="credits">${cookie.credits !== null ? cookie.credits + ' 积分' : '未测试'}</div>
+                        <div class="actions">
+                            <button class="btn btn-success btn-small" data-cookie-name="${escapeHtml(cookie.name)}" onclick="testCookie('${safeName}', event)">测试</button>
+                            <button class="btn btn-danger btn-small" onclick="deleteCookie('${safeName}', event)">删除</button>
+                        </div>
+                    </div>
+                `}).join('');
+            } catch (error) {
+                list.innerHTML = '<div class="empty">加载失败</div>';
+                showToast('加载 Cookie 列表失败', 'error');
+            }
+        }
+
+        // ==================== 设置管理 ====================
+
+        async function loadSettings() {
+            try {
+                const response = await fetch(`${API_BASE}/api/settings`);
+                const result = await response.json();
+                if (result.status === 'success') {
+                    const s = result.settings;
+                    document.getElementById('setting-task-timeout').value = s.task_timeout;
+                    const minutes = Math.floor(s.task_timeout / 60);
+                    const secs = s.task_timeout % 60;
+                    document.getElementById('current-timeout-display').textContent = 
+                        secs > 0 ? `${minutes}分${secs}秒 (${s.task_timeout}s)` : `${minutes}分钟 (${s.task_timeout}s)`;
+                    document.getElementById('settings-timeout-val').textContent = `${s.task_timeout}s (${minutes}分钟)`;
+                    document.getElementById('settings-workers-val').textContent = s.max_workers;
+                    document.getElementById('settings-debug-val').textContent = s.debug_mode ? '✅ 开启' : '❌ 关闭';
+                }
+            } catch (error) {
+                showToast('加载设置失败', 'error');
+            }
+        }
+
+        function setTaskTimeoutQuick(seconds) {
+            document.getElementById('setting-task-timeout').value = seconds;
+            saveTaskTimeout();
+        }
+
+        async function saveTaskTimeout() {
+            const input = document.getElementById('setting-task-timeout');
+            let value = parseInt(input.value);
+            if (isNaN(value) || value < 60) {
+                showToast('超时时间不能小于 60 秒', 'error');
+                return;
+            }
+            if (value > 7200) {
+                showToast('超时时间不能大于 7200 秒（2小时）', 'error');
+                return;
+            }
+            try {
+                const response = await fetch(`${API_BASE}/api/settings`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ task_timeout: value })
+                });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    showToast(result.message, 'success');
+                    loadSettings();
+                } else {
+                    showToast(result.message || '保存失败', 'error');
+                }
+            } catch (error) {
+                showToast('保存失败: ' + error.message, 'error');
+            }
+        }
+
+        async function testCookie(name, e) {
+            const btn = e ? e.target : document.querySelector(`[data-cookie-name="${name}"]`);
+            if (!btn) return;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span>';
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies/${encodeURIComponent(name)}/test`, {
+                    method: 'POST'
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast(`${name}: ${result.credits} 积分`, 'success');
+                    loadCookies();
+                } else {
+                    showToast(result.message || '测试失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误: ' + error.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '测试';
+            }
+        }
+
+        async function checkAllCookies() {
+            const btn = document.getElementById('check-all-cookies-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading"></span> 查询中...';
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies/check-all`, {
+                    method: 'POST'
+                });
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast(result.message, 'success');
+                    loadCookies();
+                } else {
+                    showToast(result.message || '查询失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '一键查询所有账号积分';
+            }
+        }
+
+        function handleCookieFileSelect(event) {
+            const file = event.target.files[0];
+            if (file) {
+                selectedCookieFile = file;
+                uploadCookieFile();
+            }
+        }
+
+        async function uploadCookieFile() {
+            if (!selectedCookieFile) return;
+
+            const formData = new FormData();
+            formData.append('file', selectedCookieFile);
+            const name = selectedCookieFile.name.replace('.json', '');
+            formData.append('name', name);
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast('Cookie 上传成功', 'success');
+                    selectedCookieFile = null;
+                    document.getElementById('cookie-file-input').value = '';
+                    loadCookies();
+                    loadStats();
+                } else {
+                    showToast(result.message || '上传失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+        }
+
+        function uploadCookieByPaste() {
+            document.getElementById('paste-modal').classList.add('show');
+        }
+
+        function closePasteModal() {
+            document.getElementById('paste-modal').classList.remove('show');
+            document.getElementById('cookie-paste-area').value = '';
+        }
+
+        function showDebugInfo() {
+            document.getElementById('debug-info-modal').classList.add('show');
+        }
+
+        function closeDebugInfo() {
+            document.getElementById('debug-info-modal').classList.remove('show');
+        }
+
+        async function submitPastedCookie() {
+            const name = document.getElementById('cookie-name-input').value.trim() || 'cookie_' + Date.now();
+            const content = document.getElementById('cookie-paste-area').value.trim();
+
+            if (!content) {
+                showToast('请粘贴 Cookie 内容', 'error');
+                return;
+            }
+
+            try {
+                JSON.parse(content);
+            } catch (e) {
+                showToast('无效的 JSON 格式', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, content })
+                });
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast('Cookie 上传成功', 'success');
+                    closePasteModal();
+                    document.getElementById('cookie-name-input').value = '';
+                    loadCookies();
+                    loadStats();
+                } else {
+                    showToast(result.message || '上传失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+        }
+
+        async function deleteCookie(name, e) {
+            if (!confirm(`确定要删除 Cookie "${name}" 吗？`)) return;
+
+            try {
+                const response = await fetch(`${API_BASE}/api/cookies/${encodeURIComponent(name)}`, {
+                    method: 'DELETE'
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const result = await response.json();
+
+                if (result.status === 'success') {
+                    showToast('Cookie 已删除', 'success');
+                    loadCookies();
+                    loadStats();
+                } else {
+                    showToast(result.message || '删除失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误: ' + error.message, 'error');
+            }
+        }
+
+        function playVideo(taskId) {
+            const modal = document.getElementById('video-modal');
+            const video = document.getElementById('modal-video');
+            const downloadLink = document.getElementById('download-link');
+
+            video.src = `${API_BASE}/api/video/${taskId}`;
+            downloadLink.href = `${API_BASE}/api/video/${taskId}`;
+            modal.classList.add('show');
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('video-modal');
+            const video = document.getElementById('modal-video');
+            modal.classList.remove('show');
+            video.pause();
+            video.src = '';
+        }
+
+        async function retryTask(taskId) {
+            try {
+                const response = await fetch(`${API_BASE}/api/task/${taskId}/retry`, { method: 'POST' });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    showToast('任务已重新提交', 'success');
+                    loadTasks();
+                    loadStats();
+                } else {
+                    showToast(result.message || '重试失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+        }
+
+        async function deleteTask(taskId) {
+            if (!confirm('确定要删除这个任务吗？')) return;
+            try {
+                const response = await fetch(`${API_BASE}/api/task/${taskId}`, { method: 'DELETE' });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    showToast('任务已删除', 'success');
+                    loadTasks();
+                    loadStats();
+                } else {
+                    showToast(result.message || '删除失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+        }
+
+        async function clearAllTasks() {
+            if (!confirm('确定要清空所有任务吗？正在运行的任务不会被清空。')) return;
+            try {
+                const response = await fetch(`${API_BASE}/api/tasks/clear`, { method: 'POST' });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    showToast('已清空 ' + result.deleted + ' 个任务', 'success');
+                    loadTasks();
+                    loadStats();
+                } else {
+                    showToast(result.message || '清空失败', 'error');
+                }
+            } catch (error) {
+                showToast('网络错误', 'error');
+            }
+        }
+
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/api/health`);
+                const result = await response.json();
+                if (result.status === 'healthy') {
+                    showToast(`服务正常 (v${result.version})，Cookie数: ${result.cookies_count}，运行中: ${result.running_tasks}`, 'success');
+                } else {
+                    showToast('服务状态异常', 'error');
+                }
+            } catch (error) {
+                showToast('无法连接到服务', 'error');
+            }
+        }
+
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function formatTime(isoString) {
+            if (!isoString) return '';
+            const date = new Date(isoString);
+            return date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+        }
+
+        // 事件委托：安全处理任务操作按钮（避免内联 onclick XSS 风险）
+        document.getElementById('task-list').addEventListener('click', (e) => {
+            const btn = e.target.closest('button[data-action]');
+            if (!btn) return;
+            const action = btn.dataset.action;
+            const taskId = btn.dataset.taskId;
+            if (!action || !taskId) return;
+            if (action === 'play') playVideo(taskId);
+            else if (action === 'retry') retryTask(taskId);
+            else if (action === 'delete') deleteTask(taskId);
+        });
+
+        // Escape key to close modals
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                closeModal();
+                closePasteModal();
+                closeDebugInfo();
+            }
+        });
+
+        // Click outside modal to close
+        document.querySelectorAll('.modal').forEach(modal => {
+            modal.addEventListener('click', (e) => {
+                if (e.target === modal) {
+                    closeModal();
+                    closePasteModal();
+                    closeDebugInfo();
+                }
+            });
+        });
+
+        // Prevent overlapping polling requests
+        let pollingInProgress = false;
+        setInterval(() => {
+            if (pollingInProgress) return;
+            pollingInProgress = true;
+            const promises = [];
+            if (document.getElementById('panel-tasks').style.display !== 'none') {
+                promises.push(loadTasks().finally(() => {}));
+            }
+            // 仅在有运行中任务时频繁轮询，否则降低频率
+            promises.push(loadStats().finally(() => {}));
+            Promise.allSettled(promises).finally(() => {
+                pollingInProgress = false;
+            });
+        }, 15000);  // 从 5s 改为 15s，降低服务器压力
+
+        updateRequiredCredits();
+        loadStats();
+        checkDebugMode();
+    </script>
+</body>
+</html>

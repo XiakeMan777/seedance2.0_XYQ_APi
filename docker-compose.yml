@@ -1,0 +1,92 @@
+services:
+  xiaoyunque:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: xiaoyunque-v3
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8033}:${PORT:-8033}"
+    environment:
+      # 应用配置
+      - PORT=8033
+      - HOST=0.0.0.0
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      # Gunicorn 并发配置（单 Worker + 多线程，因为 BrowserSession/AsyncTaskManager 是单例）
+      - GUNICORN_WORKERS=${GUNICORN_WORKERS:-1}
+      - GUNICORN_THREADS=${GUNICORN_THREADS:-20}
+      # 任务队列并发（单 worker 可处理 MAX_WORKERS 个任务）
+      # 实际并发 = MAX_WORKERS = 20 并发任务
+      - MAX_WORKERS=${MAX_WORKERS:-20}
+      # 浏览器配置
+      - HEADLESS=true
+      - BROWSER_IDLE_TIMEOUT=600
+      # 超时配置
+      - TASK_TIMEOUT=${TASK_TIMEOUT:-7200}
+      - API_TIMEOUT=60
+      - UPLOAD_TIMEOUT=120
+      - DOWNLOAD_TIMEOUT=600
+      # 时区
+      - TZ=Asia/Shanghai
+    volumes:
+      # Cookie 存储（宿主机映射，重启不丢失）
+      - ./cookies:/app/cookies
+      # 数据库存储
+      - ./data:/app/data
+      # 上传文件
+      - ./uploads:/app/uploads
+      # 生成视频
+      - ./downloads:/app/downloads
+      # 日志
+      - ./logs:/app/logs
+    # 资源限制（防止 OOM）
+    deploy:
+      resources:
+        limits:
+          # 根据服务器内存调整
+          # 每个 Chromium Context 约 300-500MB
+          # 推荐: 4GB 起步，8GB 可跑 10+ 并发
+          memory: ${MEMORY_LIMIT:-4G}
+          cpus: '${CPU_LIMIT:-2.0}'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8033/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    # 日志配置
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    # 网络
+    networks:
+      - xiaoyunque-net
+
+  # 可选：Nginx 反向代理（生产环境推荐）
+  nginx:
+    image: nginx:alpine
+    container_name: xiaoyunque-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      xiaoyunque:
+        condition: service_healthy
+    networks:
+      - xiaoyunque-net
+    profiles:
+      - with-nginx
+
+networks:
+  xiaoyunque-net:
+    driver: bridge

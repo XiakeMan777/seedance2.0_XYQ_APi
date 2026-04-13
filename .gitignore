@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Project specific - sensitive data
+cookies/*.json
+data/*.db
+data/*.json
+uploads/*
+downloads/*
+logs/*
+
+# Keep directory structure
+!cookies/.gitkeep
+!data/.gitkeep
+!uploads/.gitkeep
+!downloads/.gitkeep
+!logs/.gitkeep
+
+# Docker volumes
+data/
+
+# Archives
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# WorkBuddy internal
+.workbuddy/
