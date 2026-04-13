@@ -43,6 +43,9 @@ logs/*
 # Docker volumes
 data/
 
+# Screenshots
+Screenshot_*.png
+
 # Archives
 *.rar
 *.zip
