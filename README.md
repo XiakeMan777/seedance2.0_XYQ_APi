@@ -66,8 +66,8 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-username/xiaoyunque-v3.git
-cd xiaoyunque-v3
+git clone https://github.com/XiakeMan777/seedance2.0_XYQ_APi.git
+cd seedance2.0_XYQ_APi
 
 # 将 Cookie 文件放入 cookies 目录
 cp ~/downloads/my_cookie.json cookies/
@@ -395,7 +395,7 @@ Cookie A → 积分不足？→ Cookie B → 限流？→ Cookie C → ... → �
 ## 📁 项目结构
 
 ```
-xiaoyunque-v3/
+seedance2.0_XYQ_APi/
 ├── app_v3.py              # Flask Web 服务 + 任务管理
 ├── xiaoyunque_v3.py       # Playwright 核心引擎
 ├── static/
