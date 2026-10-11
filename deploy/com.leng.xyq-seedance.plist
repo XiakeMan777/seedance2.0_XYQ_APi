@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  小云雀 Web API —— 用户级 launchd 代理（登录后自动常驻，用户注销即停止）
+  安装：
+    cp deploy/com.leng.xyq-seedance.plist ~/Library/LaunchAgents/
+    # 先把下面的 __PROJECT_DIR__ 替换成本仓库的绝对路径
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.leng.xyq-seedance.plist
+  卸载：
+    launchctl bootout gui/$(id -u)/com.leng.xyq-seedance
+  说明：只影响当前用户，不修改系统级配置；不启动任何浏览器。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.leng.xyq-seedance</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PROJECT_DIR__/start.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOST</key>
+        <string>127.0.0.1</string>
+        <key>PORT</key>
+        <string>8033</string>
+        <key>MAX_WORKERS</key>
+        <string>1</string>
+        <key>BROWSER_CDP_URL</key>
+        <string>http://127.0.0.1:18800</string>
+        <key>ALLOW_BROWSER_LAUNCH</key>
+        <string>false</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/xyq-seedance.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/xyq-seedance.launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>

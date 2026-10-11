@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小云雀服务 · 账号状态</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 20px 56px;
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+    background: #0f1115; color: #e6e8ee;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8b93a7; font-size: 13px; margin-bottom: 24px; }
+  .card {
+    background: #171a21; border: 1px solid #242938; border-radius: 12px;
+    padding: 18px 20px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 14px; margin: 0 0 14px; color: #aab3c7; font-weight: 600; letter-spacing: .02em; }
+  .row { display: flex; justify-content: space-between; gap: 16px; padding: 7px 0; border-bottom: 1px dashed #232838; }
+  .row:last-child { border-bottom: none; }
+  .k { color: #8b93a7; }
+  .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; text-align: right; word-break: break-all; }
+  .ok { color: #4ade80; }
+  .warn { color: #fbbf24; }
+  .bad { color: #f87171; }
+  .muted { color: #6b7280; }
+  button {
+    background: #2b6cf6; color: #fff; border: 0; border-radius: 8px;
+    padding: 9px 18px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: default; }
+  .notice { font-size: 13px; color: #9aa3b8; margin-top: 12px; }
+  pre { background: #0b0d11; border: 1px solid #232838; border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
+  a { color: #6ea8fe; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>小云雀服务 · 账号状态</h1>
+  <div class="sub">只读检查：浏览器连接、登录态与剩余积分。本页不会提交任何生成任务，也不会消耗积分。</div>
+
+  <div class="card">
+    <h2>服务</h2>
+    <div class="row"><span class="k">运行状态</span><span class="v" id="svc-status">检查中…</span></div>
+    <div class="row"><span class="k">浏览器模式</span><span class="v" id="svc-mode">—</span></div>
+    <div class="row"><span class="k">CDP 端点</span><span class="v" id="svc-cdp">—</span></div>
+    <div class="row"><span class="k">已连接浏览器</span><span class="v" id="svc-connected">—</span></div>
+    <div class="row"><span class="k">允许自启浏览器</span><span class="v" id="svc-launch">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>账号（本机已登录 Chrome）</h2>
+    <div class="row"><span class="k">登录状态</span><span class="v" id="acct-login">检查中…</span></div>
+    <div class="row"><span class="k">剩余积分</span><span class="v" id="acct-credits">—</span></div>
+    <div class="row"><span class="k">会员状态</span><span class="v" id="acct-member">—</span></div>
+    <div class="row"><span class="k">workspace_id</span><span class="v" id="acct-ws">—</span></div>
+    <div class="row"><span class="k">说明</span><span class="v muted" id="acct-err">—</span></div>
+    <div class="notice" id="acct-hint"></div>
+  </div>
+
+  <div class="card">
+    <h2>操作</h2>
+    <button id="refresh">刷新（只读）</button>
+    <div class="notice">若要切换账号：在宿主浏览器里登录目标小云雀账号后点刷新即可，服务不读取、不导出任何 Cookie。</div>
+  </div>
+
+  <div class="card">
+    <h2>原始响应</h2>
+    <pre id="raw">—</pre>
+  </div>
+</div>
+
+<script>
+function setText(id, text, cls) {
+  var el = document.getElementById(id);
+  el.textContent = text;
+  el.className = 'v' + (cls ? ' ' + cls : '');
+}
+
+function yesNo(flag, yesText, noText) {
+  return flag ? (yesText || '是') : (noText || '否');
+}
+
+function refresh() {
+  var btn = document.getElementById('refresh');
+  btn.disabled = true;
+  setText('acct-login', '检查中…');
+
+  fetch('/api/health').then(function (r) { return r.json(); }).then(function (h) {
+    setText('svc-status', h.status === 'healthy' ? '正常' : String(h.status), h.status === 'healthy' ? 'ok' : 'warn');
+    setText('svc-mode', h.account_mode || '—');
+    setText('svc-cdp', h.browser && h.browser.cdp_url ? h.browser.cdp_url : '（未配置）');
+    setText('svc-connected', yesNo(h.browser && h.browser.connected, '已连接', '未连接'),
+            h.browser && h.browser.connected ? 'ok' : 'warn');
+    setText('svc-launch', yesNo(h.browser && h.browser.launch_allowed, '允许', '禁止'));
+  }).catch(function (e) { setText('svc-status', '读取失败: ' + e, 'bad'); });
+
+  fetch('/api/account/status').then(function (r) { return r.json(); }).then(function (d) {
+    document.getElementById('raw').textContent = JSON.stringify(d, null, 2);
+
+    if (d.logged_in === true) {
+      setText('acct-login', '已登录', 'ok');
+      setText('acct-credits', (d.credits === null || d.credits === undefined) ? '—' : String(d.credits));
+      setText('acct-member', d.membership || '—');
+      setText('acct-ws', d.workspace_id || '—');
+      setText('acct-err', '—');
+      document.getElementById('acct-hint').textContent = '';
+    } else if (d.logged_in === false) {
+      setText('acct-login', '未登录', 'bad');
+      setText('acct-credits', '—');
+      setText('acct-member', '—');
+      setText('acct-ws', '—');
+      setText('acct-err', d.error || '登录态无效');
+      document.getElementById('acct-hint').innerHTML =
+        '请在宿主浏览器中打开 <a href="https://xyq.jianying.com/home" target="_blank" rel="noreferrer">xyq.jianying.com</a> 并登录（扫码即可），登录态会保留在该浏览器中，然后回到本页点刷新。';
+    } else {
+      setText('acct-login', '未知', 'warn');
+      setText('acct-err', d.error || '未获取到登录信息');
+    }
+  }).catch(function (e) {
+    setText('acct-login', '读取失败', 'bad');
+    setText('acct-err', String(e));
+  }).then(function () { btn.disabled = false; });
+}
+
+document.getElementById('refresh').addEventListener('click', refresh);
+refresh();
+</script>
+</body>
+</html>

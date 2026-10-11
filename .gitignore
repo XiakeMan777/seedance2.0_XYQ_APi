@@ -32,6 +32,9 @@ data/*.json
 uploads/*
 downloads/*
 logs/*
+run/
+.env
+.env.local
 
 # Keep directory structure
 !cookies/.gitkeep

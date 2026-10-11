@@ -1,4 +1,11 @@
-playwright==1.40.0
+# 外部浏览器模式（默认）：连接本机已运行、已登录的 Chrome，直连其 CDP 端点
+websocket-client>=1.7.0
+
+# 独立部署模式（需显式设置 ALLOW_BROWSER_LAUNCH=true）所需的浏览器自动化依赖
+# 已验证：playwright 1.40 无法连接新版 Chrome（Browser.setDownloadBehavior 被拒），
+# 请使用 1.55 及以上版本
+playwright>=1.55,<2
+
 Flask>=2.3.0
 Werkzeug>=2.3.0
 requests>=2.31.0

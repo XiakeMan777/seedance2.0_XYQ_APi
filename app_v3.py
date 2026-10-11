@@ -42,6 +42,8 @@ from xiaoyunque_v3 import (
     get_token_files,
     load_cookies,
     parse_tokens,
+    using_live_browser,
+    LIVE_SESSION_NAME,
     config,
     APIException,
     ErrorCode,
@@ -827,10 +829,65 @@ def health_check():
         'version': '3.0.0',
         'max_workers': MAX_WORKERS,
         'running_tasks': task_manager.get_running_count(),
-        'cookies_count': len(cookies_files),
+        'cookies_count': account_count(),
+        'account_mode': browser_mode(),
+        'browser': {
+            'mode': browser_mode(),
+            'cdp_url': config.cdp_url or None,
+            'launch_allowed': config.allow_browser_launch,
+            'connected': browser_session.is_connected(),
+        },
         'debug_mode': get_debug_mode(),
         'task_timeout': get_task_timeout()
     })
+
+
+@app.route('/status')
+def account_status_page():
+    """只读账号/服务状态页（独立于管理后台，便于快速核对登录与积分）。"""
+    return send_file(os.path.join(app.static_folder, 'account_status.html'))
+
+
+@app.route('/api/account/status', methods=['GET'])
+def account_status():
+    """只读查询当前账号：浏览器连接、登录态与剩余积分。
+
+    不会提交生成任务、不消耗积分；失败时返回明确的 error 字段，不伪造结果。
+    """
+    result = {
+        'mode': browser_mode(),
+        'live_browser': using_live_browser(),
+        'cdp_url': config.cdp_url or None,
+        'launch_allowed': config.allow_browser_launch,
+        'browser_connected': browser_session.is_connected(),
+        'account': LIVE_SESSION_NAME if using_live_browser() else None,
+        'logged_in': None,
+        'credits': None,
+        'workspace_id': None,
+        'membership': None,
+        'error': None,
+        'read_only': True,
+    }
+
+    if not using_live_browser():
+        result['error'] = '当前非外部浏览器模式，未接入本机 Chrome'
+        return jsonify(result)
+
+    try:
+        info = run_async(
+            _read_live_account_async(),
+            timeout=int(os.environ.get('ACCOUNT_CHECK_TIMEOUT', 90)),
+        )
+    except Exception as e:
+        result['error'] = str(e)
+        result['browser_connected'] = browser_session.is_connected()
+        return jsonify(result)
+
+    result.update(info)
+    result['browser_connected'] = browser_session.is_connected()
+    if result.get('logged_in'):
+        save_account_credit(LIVE_SESSION_NAME, result.get('credits'))
+    return jsonify(result)
 
 @app.route('/api/debug-mode', methods=['GET'])
 def get_debug_mode_api():
@@ -899,8 +956,129 @@ def update_settings():
 
 # ==================== Cookie 管理 ====================
 
+# ==================== 浏览器 / 账号模式 ====================
+#
+# 默认『外部浏览器模式』(live-browser)：直接连接本机已运行、已登录的小云雀 Chrome，
+# 复用其登录态。该模式下只有用户本人一个账号：
+#   - 不读取、不上传、不导出任何 Cookie 文件；
+#   - 不轮换账号、不自动切换；
+#   - 连不上现有 Chrome 时明确报错，不自动另起浏览器。
+# 仅当显式设置 BROWSER_CDP_URL 为空且 ALLOW_BROWSER_LAUNCH=true 时，才回退到原 cookie 文件模式。
+
+def browser_mode() -> str:
+    """当前浏览器接入模式：live-browser 或 cookie-files。"""
+    return 'live-browser' if using_live_browser() else 'cookie-files'
+
+
+def account_count() -> int:
+    """当前可用账号数量。"""
+    return 1 if using_live_browser() else len(get_token_files())
+
+
+def _db_credit_for(name: str):
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT credits, last_used, status FROM cookies WHERE name = ?', (name,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return {'credits': row[0], 'last_used': row[1], 'status': row[2]}
+    except Exception:
+        pass
+    return None
+
+
+def live_account() -> dict:
+    """外部浏览器模式下的唯一账号（纯本地展示，不发网络请求）。"""
+    info = _db_credit_for(LIVE_SESSION_NAME) or {}
+    return {
+        'id': 1,
+        'name': LIVE_SESSION_NAME,
+        'filename': None,
+        'path': None,
+        'size': 0,
+        'credits': info.get('credits'),
+        'last_used': info.get('last_used'),
+        'status': info.get('status') or 'live',
+        'source': '本机已登录 Chrome（复用现有登录态，不导出 Cookie）',
+    }
+
+
+def save_account_credit(name: str, credits):
+    """把只读查到的积分缓存到本地库，便于列表展示。"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO cookies (name, file_path, credits, last_used, status, created_at)
+            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM cookies WHERE name = ?), ?))
+        ''', (name, '', credits, datetime.now().isoformat(), 'active', name, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f'[WARN] 保存积分缓存失败: {e}')
+
+
+def account_required_message() -> str:
+    if using_live_browser():
+        return ('未连接本机已登录 Chrome。请确认浏览器已启动，'
+                f'且 BROWSER_CDP_URL（当前 {config.cdp_url or "未设置"}）可访问')
+    return '请先上传 Cookie 文件'
+
+
+async def _read_live_account_async() -> dict:
+    """只读查询：复用本机已登录 Chrome，读取登录态与剩余积分。
+
+    只调用 workspace/get_user_workspace（查询接口），不提交任何生成任务、不消耗积分。
+    """
+    from xiaoyunque_v3 import api_post, acquire_page, read_account_badge
+
+    ctx = await browser_session.get_context(None)
+    page, created = await acquire_page(ctx)
+    try:
+        try:
+            await asyncio.wait_for(
+                page.goto('https://xyq.jianying.com/home', wait_until='domcontentloaded'),
+                timeout=config.page_load_timeout,
+            )
+        except asyncio.TimeoutError:
+            pass
+        await page.wait_for_timeout(3000)
+
+        resp = json.loads(await api_post(page, '/api/web/v1/workspace/get_user_workspace', {}))
+        if str(resp.get('ret')) != '0':
+            msg = resp.get('message') or resp.get('msg') or resp
+            return {'logged_in': False, 'credits': None, 'workspace_id': None, 'membership': None,
+                    'error': f'登录态无效 (ret={resp.get("ret")}, {msg})'}
+        data = resp.get('data') or {}
+        badge = await read_account_badge(page)
+        return {
+            'logged_in': True,
+            'credits': badge.get('credits'),
+            'workspace_id': data.get('workspace_id'),
+            'membership': badge.get('membership'),
+            'error': None,
+        }
+    finally:
+        if page and created:
+            try:
+                await asyncio.wait_for(page.close(), timeout=10)
+            except Exception:
+                pass
+
+
 @app.route('/api/cookies', methods=['GET'])
 def list_cookies():
+    if using_live_browser():
+        return jsonify({
+            'cookies': [live_account()],
+            'count': 1,
+            'mode': browser_mode()
+        })
+
     cookies_files = get_token_files()
     cookies_list = []
     for i, fname in enumerate(cookies_files):
@@ -945,6 +1123,11 @@ def list_cookies():
 
 @app.route('/api/cookies', methods=['POST'])
 def upload_cookie():
+    if using_live_browser():
+        return jsonify({
+            'status': 'error',
+            'message': '当前为外部浏览器模式，直接复用本机已登录 Chrome，无需上传 Cookie'
+        }), 400
     try:
         name = request.form.get('name', '').strip()
         content = None
@@ -1002,6 +1185,11 @@ def upload_cookie():
 
 @app.route('/api/cookies/<cookie_name>', methods=['DELETE'])
 def delete_cookie(cookie_name):
+    if using_live_browser():
+        return jsonify({
+            'status': 'error',
+            'message': '当前为外部浏览器模式，账号来自本机已登录 Chrome，无法在此删除'
+        }), 400
     try:
         if not cookie_name.endswith('.json'):
             cookie_name = cookie_name + '.json'
@@ -1019,6 +1207,24 @@ def delete_cookie(cookie_name):
 @app.route('/api/cookies/<cookie_name>/test', methods=['POST'])
 def test_cookie(cookie_name):
     """测试单个 Cookie 的积分"""
+    if using_live_browser():
+        account_name = cookie_name[:-5] if cookie_name.endswith('.json') else cookie_name
+        if account_name != LIVE_SESSION_NAME:
+            return jsonify({'status': 'error', 'message': '外部浏览器模式下只有本机实时会话这一账号'}), 404
+        try:
+            info = run_async(_read_live_account_async(),
+                             timeout=int(os.environ.get('ACCOUNT_CHECK_TIMEOUT', 90)))
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+        if not info.get('logged_in'):
+            return jsonify({'status': 'error', 'message': info.get('error') or '登录态无效'}), 401
+        save_account_credit(LIVE_SESSION_NAME, info.get('credits'))
+        return jsonify({
+            'status': 'success',
+            'cookie_name': LIVE_SESSION_NAME,
+            'credits': info.get('credits'),
+            'message': f"积分查询成功: {info.get('credits')}"
+        })
     try:
         if not cookie_name.endswith('.json'):
             cookie_name = cookie_name + '.json'
@@ -1082,6 +1288,31 @@ def test_cookie(cookie_name):
 @app.route('/api/cookies/check-all', methods=['POST'])
 def check_all_cookies():
     """批量查询所有 Cookie 积分"""
+    if using_live_browser():
+        try:
+            info = run_async(_read_live_account_async(),
+                             timeout=int(os.environ.get('ACCOUNT_CHECK_TIMEOUT', 90)))
+        except Exception as e:
+            return jsonify({
+                'status': 'success',
+                'results': [{'name': LIVE_SESSION_NAME, 'filename': None, 'credits': None,
+                             'status': 'failed', 'error': str(e)}],
+                'message': f'查询失败: {e}'
+            })
+        if info.get('logged_in'):
+            save_account_credit(LIVE_SESSION_NAME, info.get('credits'))
+            return jsonify({
+                'status': 'success',
+                'results': [{'name': LIVE_SESSION_NAME, 'filename': None,
+                             'credits': info.get('credits'), 'status': 'success'}],
+                'message': f"查询完成，积分 {info.get('credits')}"
+            })
+        return jsonify({
+            'status': 'success',
+            'results': [{'name': LIVE_SESSION_NAME, 'filename': None, 'credits': None,
+                         'status': 'failed', 'error': info.get('error')}],
+            'message': f"查询失败: {info.get('error')}"
+        })
     try:
         cookies_files = get_token_files()
         if not cookies_files:
@@ -1200,9 +1431,8 @@ def generate_video_openai():
         if ratio not in ['16:9', '9:16']:
             return error_response(ErrorCode.PARAMS_INVALID, '比例必须是 16:9 或 9:16')
 
-        cookies_files = get_token_files()
-        if not cookies_files:
-            return error_response(ErrorCode.PARAMS_INVALID, '请先上传 Cookie 文件')
+        if not using_live_browser() and not get_token_files():
+            return error_response(ErrorCode.PARAMS_INVALID, account_required_message())
 
         model_map = {'seedance-2.0-fast': 'fast', 'seedance-2.0': '2.0'}
         xiaoyunque_model = model_map.get(model, 'fast')
@@ -1316,9 +1546,8 @@ def generate_video():
         if ratio not in ['16:9', '9:16']:
             return jsonify({'status': 'error', 'message': '比例必须是 16:9 或 9:16'}), 400
 
-        cookies_files = get_token_files()
-        if not cookies_files:
-            return jsonify({'status': 'error', 'message': '请先上传 Cookie 文件'}), 400
+        if not using_live_browser() and not get_token_files():
+            return jsonify({'status': 'error', 'message': account_required_message()}), 400
 
         model_map = {'seedance-2.0-fast': 'fast', 'seedance-2.0': '2.0'}
         xiaoyunque_model = model_map.get(model, 'fast')
@@ -1506,14 +1735,13 @@ def get_stats():
         if status in stats:
             stats[status] = count
 
-    cookies_files = get_token_files()
-
     return jsonify({
         'status': 'success',
         'stats': stats,
         'total': sum(stats.values()),
         'running': task_manager.get_running_count(),
-        'cookies_count': len(cookies_files)
+        'cookies_count': account_count(),
+        'account_mode': browser_mode()
     })
 
 # ==================== 后台任务 ====================

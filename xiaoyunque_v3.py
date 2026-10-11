@@ -49,8 +49,21 @@ class Config:
     headless: bool = os.environ.get('HEADLESS', 'true').lower() == 'true'
     # v4: API 调用最小间隔
     min_api_interval: float = float(os.environ.get('MIN_API_INTERVAL', '3.0'))
+    # 外部浏览器（连接本机已运行、已登录的 Chrome，复用其登录态）
+    # 默认连接宿主浏览器运行时暴露的 CDP 端点；设为空字符串可关闭该模式
+    cdp_url: str = os.environ.get('BROWSER_CDP_URL', 'http://127.0.0.1:18800').strip()
+    # 是否允许在本机启动独立 Chromium。默认关闭：连不上现有 Chrome 时直接明确报错，不偷偷另起浏览器
+    allow_browser_launch: bool = os.environ.get('ALLOW_BROWSER_LAUNCH', 'false').lower() == 'true'
 
 config = Config()
+
+# 外部浏览器模式下，所有请求复用同一个实时会话（用户本人已登录的 Chrome）
+LIVE_SESSION_NAME = 'chrome-live'
+
+
+def using_live_browser() -> bool:
+    """是否使用『连接本机已登录 Chrome』模式（默认开启）。"""
+    return bool(config.cdp_url)
 
 # ==================== 每账号 API 限速 ====================
 
@@ -165,52 +178,119 @@ def select_cookie_file() -> Optional[str]:
 # ==================== 浏览器会话管理 ====================
 
 class BrowserSession:
-    """单例浏览器 + 多 Context 会话管理"""
+    """单例浏览器会话管理。
+
+    两种模式：
+    - 外部模式（默认，config.cdp_url 非空）：连接本机已运行、已登录的 Chrome，
+      复用其现有登录态；绝不新启动浏览器，绝不注入或改写 cookie。
+    - 启动模式（需显式 ALLOW_BROWSER_LAUNCH=true）：为独立部署保留原逻辑
+      （单例 Chromium + 多 Context + cookie 文件）。
+    """
     
     def __init__(self):
         self.playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
+        self.cdp = None  # 外部模式：browser_cdp.CdpBrowser 实例
         self.contexts: Dict[str, BrowserContext] = {}
         self.context_last_used: Dict[str, float] = {}
         self._launching = False
+        self._external = False
+
+    def is_external(self) -> bool:
+        """当前是否为『复用用户本机已登录 Chrome』的外部模式。"""
+        if using_live_browser():
+            return True
+        return self._external
+
+    def is_connected(self) -> bool:
+        """当前浏览器连接是否可用（供健康检查使用，不做网络访问）。"""
+        if self._external:
+            return self.cdp is not None
+        return bool(self.browser and self.browser.is_connected())
+
+    def _is_ready(self) -> bool:
+        if self._external:
+            return self.cdp is not None
+        return bool(self.browser and self.browser.is_connected())
     
     async def ensure_browser(self):
-        """懒启动浏览器，防止并发重复启动"""
-        if self.browser and self.browser.is_connected():
+        """懒连接/懒启动浏览器，防止并发重复操作"""
+        if self._is_ready():
             return
 
-        # 如果正在启动，等待完成
+        # 如果正在连接，等待完成
         if self._launching:
             for _ in range(300):
                 await asyncio.sleep(0.1)
-                if self.browser and self.browser.is_connected():
+                if self._is_ready():
                     return
                 if not self._launching:
                     break
-            if self.browser and self.browser.is_connected():
+            if self._is_ready():
                 return
 
         self._launching = True
         try:
-            if not self.playwright:
-                log('[*] 启动 Playwright...')
-                self.playwright = await async_playwright().start()
-            if not self.browser or not self.browser.is_connected():
-                log('[*] 启动 Chromium...')
-                self.browser = await self.playwright.chromium.launch(
-                    headless=config.headless,
-                    args=['--no-sandbox', '--disable-web-security']
-                )
-                log('[Browser] Chromium 已启动')
-        except Exception as e:
-            log(f'[ERROR] 浏览器启动失败: {e}')
-            raise
+            if not self._is_ready():
+                await self._connect_or_launch()
         finally:
             self._launching = False
 
-    async def get_context(self, cookie_file: str) -> BrowserContext:
-        """获取或创建 Context，复用已存在的会话"""
+    async def _connect_or_launch(self):
+        """外部模式只连接现有 Chrome；启动模式需显式开启，绝不隐式另起浏览器。"""
+        if config.cdp_url:
+            log(f'[*] 连接现有 Chrome (CDP): {config.cdp_url}')
+            try:
+                from browser_cdp import CdpBrowser
+                self.cdp = CdpBrowser(config.cdp_url)
+                version = await self.cdp.probe()
+            except Exception as e:
+                log(f'[ERROR] 连接现有 Chrome 失败: {e}')
+                self.cdp = None
+                raise APIException(
+                    ErrorCode.BROWSER_ERROR,
+                    f'无法连接现有 Chrome（CDP {config.cdp_url}）：{e}。'
+                    '请确认本机浏览器已启动且 CDP 端点可用；本项目默认不会自动启动新浏览器'
+                    '（如需独立浏览器请显式设置 ALLOW_BROWSER_LAUNCH=true）'
+                )
+            self._external = True
+            log(f"[Browser] 已连接现有 Chrome {version.get('product', '')}，复用其登录态（不注入 cookie）")
+            return
+
+        if not config.allow_browser_launch:
+            raise APIException(
+                ErrorCode.BROWSER_ERROR,
+                '未配置可用浏览器：BROWSER_CDP_URL 为空且未开启 ALLOW_BROWSER_LAUNCH。'
+                '请设置 BROWSER_CDP_URL 指向已登录 Chrome 的 CDP 端点'
+            )
+
+        if not self.playwright:
+            log('[*] 启动 Playwright 驱动...')
+            self.playwright = await async_playwright().start()
+        log('[*] 启动独立 Chromium (ALLOW_BROWSER_LAUNCH=true)...')
+        self.browser = await self.playwright.chromium.launch(
+            headless=config.headless,
+            args=['--no-sandbox', '--disable-web-security']
+        )
+        self._external = False
+        log('[Browser] Chromium 已启动')
+
+    async def get_context(self, cookie_file: Optional[str] = None) -> BrowserContext:
+        """获取当前账号对应的 Context。
+
+        外部模式：直接复用已连接 Chrome 的默认 Context（其登录态即用户本人账号），
+        不创建新 Context、不注入 cookie、不改写 UA/路由，避免影响用户正在浏览的标签页。
+        启动模式：沿用原有按 cookie 文件隔离的多 Context 逻辑。
+        """
         await self.ensure_browser()
+
+        if self._external:
+            if not self.cdp:
+                raise APIException(ErrorCode.BROWSER_ERROR, '未连接到现有 Chrome，请先确认 CDP 端点可用')
+            ctx = self.cdp.default_context()
+            self.contexts[LIVE_SESSION_NAME] = ctx
+            self.context_last_used[LIVE_SESSION_NAME] = time.time()
+            return ctx
         
         if cookie_file in self.contexts:
             ctx = self.contexts[cookie_file]
@@ -250,6 +330,9 @@ class BrowserSession:
     
     async def cleanup_idle(self):
         """清理空闲超时的 Context"""
+        if self._external:
+            # 外部模式复用用户浏览器，绝不关闭其 Context
+            return
         now = time.time()
         to_remove = []
         for key, last_used in self.context_last_used.items():
@@ -266,15 +349,29 @@ class BrowserSession:
             del self.context_last_used[key]
     
     async def close(self):
-        """关闭所有资源"""
-        for ctx in self.contexts.values():
+        """关闭资源。
+
+        外部模式：仅断开本进程与用户 Chrome 的 CDP 连接，绝不关闭用户浏览器或其标签页。
+        """
+        self.contexts.clear()
+        self.context_last_used.clear()
+
+        if self._external:
+            if self.cdp:
+                try:
+                    self.cdp.close()  # 仅断开 CDP 连接，不关闭用户浏览器
+                except Exception:
+                    pass
+            self.cdp = None
+            self._external = False
+            return
+
+        for ctx in list(self.contexts.values()):
             try:
                 await ctx.close()
             except Exception:
                 pass
-        self.contexts.clear()
-        self.context_last_used.clear()
-        
+
         if self.browser:
             try:
                 await self.browser.close()
@@ -343,16 +440,54 @@ async def check_credits(page: Page) -> Optional[int]:
         return None
 
 async def get_credits_info(page: Page) -> Optional[int]:
+    """只读读取剩余积分。
+
+    注意：小云雀 web 端已不再在 workspace 接口里返回 remain_credit，
+    而 commerce 侧的 user_credit 接口需要 msToken/a_bogus 签名（匿名请求会被反爬拦截）。
+    因此这里先从页面上的积分徽标读取真实数值；读不到就返回 None（未知），
+    绝不把「字段不存在」当成 0，否则会造成「积分不足」的误判而无法生成。
+    """
+    # 1) 若接口恢复返回 remain_credit，则优先采用（只有字段真的存在才算数）
     try:
         resp = await api_post(page, '/api/web/v1/workspace/get_user_workspace', {})
-        data = json.loads(resp)
-        if str(data.get('ret')) == '0':
-            credits = data.get('data', {}).get('remain_credit', 0)
-            if credits > 0:
-                return credits
+        data = json.loads(resp).get('data') or {}
+        if isinstance(data, dict) and 'remain_credit' in data:
+            return data.get('remain_credit')
     except Exception:
-        log('[WARN] API 积分查询失败，回退到 DOM 解析')
+        pass
+
+    # 2) 当前 web 端的真实来源：页面右上角积分徽标
+    badge = await read_account_badge(page)
+    if badge.get('credits') is not None:
+        return badge['credits']
+
+    # 3) 兜底：原有启发式
     return await check_credits(page)
+
+
+async def read_account_badge(page: Page) -> dict:
+    """只读读取页面上的积分徽标与会员标签（不调用任何消耗积分的接口）。"""
+    empty = {'credits': None, 'membership': None}
+    try:
+        result = await page.evaluate('''() => {
+            const out = {credits: null, membership: null};
+            const badge = document.querySelector('[class*="pointsBadgeValue"]');
+            if (badge) {
+                const m = (badge.textContent || '').match(/[0-9][0-9,]*/);
+                if (m) out.credits = parseInt(m[0].replace(/,/g, ''), 10);
+            }
+            const sub = document.querySelector('[class*="subscriptionComboButtonText"]');
+            if (sub) {
+                const t = (sub.textContent || '').trim();
+                if (t) out.membership = t.split('低至')[0].trim() || t;
+            }
+            return out;
+        }''')
+        if not isinstance(result, dict):
+            return empty
+        return {'credits': result.get('credits'), 'membership': result.get('membership')}
+    except Exception:
+        return empty
 
 # ==================== 安全审核 ====================
 
@@ -508,6 +643,50 @@ async def submit_task(page: Page, prompt: str, images: list, duration: int,
 
 # ==================== 多策略视频 URL 提取 ====================
 
+# 任务产物（artifact / message）里存放视频的结构键。
+# 形如 entry['artifact']['content'][i]['data']，而 data 本身还是一段 JSON 字符串。
+_VIDEO_CONTAINER_KEYS = ('content', 'artifact', 'message', 'data', 'entry_list', 'run_list')
+
+
+def _find_video_url(obj, depth: int = 0) -> Optional[str]:
+    """在（可能层层嵌套 JSON 字符串的）任务产物里查找视频地址。
+
+    小云雀返回的视频直链不含 .mp4 后缀（例如
+    https://v11-xyq-video.jianying.com/<hash>/<hash>/video/...?<签名>），
+    因此这里只认显式的 video 字段（download_url / url / play_url / preview_url），
+    不做扩展名猜测，也不接受其它任意 http 链接。
+    """
+    if obj is None or depth > 12:
+        return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        if s[:1] in ('{', '['):
+            try:
+                return _find_video_url(json.loads(s), depth + 1)
+            except json.JSONDecodeError:
+                return None
+        return None
+    if isinstance(obj, list):
+        for item in obj:
+            found = _find_video_url(item, depth + 1)
+            if found:
+                return found
+        return None
+    if isinstance(obj, dict):
+        video = obj.get('video')
+        if isinstance(video, dict):
+            for key in ('download_url', 'url', 'play_url', 'preview_url'):
+                value = video.get(key)
+                if isinstance(value, str) and value.startswith('http'):
+                    return _html.unescape(value)
+        for key in _VIDEO_CONTAINER_KEYS:
+            if key in obj:
+                found = _find_video_url(obj[key], depth + 1)
+                if found:
+                    return found
+    return None
+
+
 def extract_video_url(data: dict) -> Optional[str]:
     """多策略降级提取视频 URL"""
     if not data:
@@ -536,8 +715,11 @@ def extract_video_url(data: dict) -> Optional[str]:
         urls = re.findall(pattern, json_str)
         if urls:
             return _html.unescape(urls[0])
-    
-    return None
+
+    # 策略 3: 任务产物内嵌 JSON 中的显式 video 字段。
+    # 上面的正则要求 URL 含 .mp4，而小云雀的真实直链并不含该后缀，
+    # 所以完成任务（state=3）时也必须走这一条，否则会一直取不到地址。
+    return _find_video_url(data)
 
 # ==================== 固定间隔轮询 ====================
 
@@ -666,17 +848,41 @@ def download_video(mp4_url: str, output_path: str, timeout: int = None) -> bool:
 
 # ==================== 核心执行流程 ====================
 
+async def acquire_page(ctx: BrowserContext):
+    """获取用于操作小云雀的工作 Page。
+
+    外部模式优先复用已打开的小云雀标签页，避免在用户浏览器里堆叠新窗口。
+    返回 (page, created)：created 为 False 表示复用了用户已有的标签，调用方不得关闭它。
+    """
+    if browser_session.is_external():
+        try:
+            page = await ctx.page_for_url('xyq.jianying.com')
+            if page is not None:
+                return page, False
+        except AttributeError:
+            # 兼容 Playwright 风格的 Context（pages 为同步属性）
+            for p in (ctx.pages or []):
+                if 'xyq.jianying.com' in (getattr(p, 'url', '') or ''):
+                    return p, False
+    return await ctx.new_page(), True
+
+
 async def run_with_cookie(prompt: str, duration: int, ratio: str, model: str,
-                         ref_images: list, output_dir: str, cookie_file: str) -> Optional[str]:
-    cookie_name = os.path.basename(cookie_file).replace('.json', '')
-    log(f'[*] 使用 Cookie: {os.path.basename(cookie_file)}')
+                         ref_images: list, output_dir: str, cookie_file: Optional[str] = None) -> Optional[str]:
+    if cookie_file:
+        cookie_name = os.path.basename(cookie_file).replace('.json', '')
+        log(f'[*] 使用 Cookie: {os.path.basename(cookie_file)}')
+    else:
+        cookie_name = LIVE_SESSION_NAME
+        log('[*] 使用本机已登录 Chrome 会话（用户本人账号）')
     log(f'[*] 小云雀 - {prompt[:30]}... | {duration}s | {ratio} | {MODEL_LABELS.get(model, model)}')
 
     ctx = None
     page = None
+    created_page = False
     try:
         ctx = await browser_session.get_context(cookie_file)
-        page = await ctx.new_page()
+        page, created_page = await acquire_page(ctx)
         
         try:
             await asyncio.wait_for(
@@ -756,7 +962,7 @@ async def run_with_cookie(prompt: str, duration: int, ratio: str, model: str,
         traceback.print_exc()
         raise APIException(ErrorCode.BROWSER_ERROR, str(e))
     finally:
-        if page:
+        if page and created_page:
             try:
                 await asyncio.wait_for(page.close(), timeout=10)
             except (asyncio.TimeoutError, Exception):
@@ -771,6 +977,18 @@ async def run(prompt: str, duration: int = 10, ratio: str = '16:9',
     ratio = ratio if ratio != '1:1' else '16:9'
     output_dir = output_dir or config.output_dir
     os.makedirs(output_dir, exist_ok=True)
+
+    if using_live_browser():
+        # 单账号模式：只使用用户本人已登录的浏览器，不轮换、不切换到任何其他账号
+        return await run_with_cookie(
+            prompt=prompt,
+            duration=duration,
+            ratio=ratio,
+            model=model_key,
+            ref_images=ref_images or [],
+            output_dir=output_dir,
+            cookie_file=None
+        )
 
     if cookie_file:
         cookie_files = [cookie_file]
